@@ -1,0 +1,1225 @@
+{% extends "base.html" %}
+{% block title %}pq-tracker ({{ total }} matching){% endblock %}
+{% block headerstats %}
+  {{ total_in_db }} PQs tracked &middot; {{ pending_count }} pending answer &middot;
+  showing {{ total }} matches
+{% endblock %}
+{% block content %}
+<div class="action-bar">
+  <a class="btn secondary" href="{{ url_for('list_view') }}">Clear all</a>
+  <button class="btn secondary" type="button" id="cols-btn"
+          title="Choose which columns are shown. Preference persists locally.">
+    Columns
+  </button>
+  <a class="btn secondary" href="{{ url_for('export_xlsx', **request.args.to_dict(flat=False)) }}"
+     title="Download the current filtered view as an .xlsx file">
+    ⬇ Export to Excel
+  </a>
+  <span style="color:var(--muted);font-size:12px;align-self:center;">
+    Click any row for full details + edit.
+    Blue chips = auto-tags (from <code>topics.yaml</code> via
+    <a href="{{ url_for('settings_view') }}">settings</a>),
+    yellow chips = your tags.
+  </span>
+</div>
+
+{# Active-filters pill row — only rendered if at least one filter or a search is set. #}
+{% set has_active_filters = (f.q or f.td or f.party or f.constituency or f.dept or f.topic or f.tag or f.status or f['from'] or f.to or f.from_ans or f.to_ans or f.pqref or f.constit or f.notes) %}
+{% if has_active_filters %}
+<div class="active-filters" id="active-filters">
+  <span class="active-filters-label">Filters:</span>
+  {% macro pill(label, key, value) %}
+    <span class="pill" data-remove-key="{{ key }}" data-remove-value="{{ value }}">
+      <span class="pill-label">{{ label }}:</span> {{ value }}
+      <button type="button" class="pill-x" aria-label="Remove">&times;</button>
+    </span>
+  {% endmacro %}
+  {% if f.q %}
+    <span class="pill pill-search" data-remove-key="q" data-remove-value=""
+          title="Click to edit; × to clear search.">
+      <span class="pill-label">Search:</span> "{{ f.q }}"
+      <button type="button" class="pill-x" aria-label="Clear search">&times;</button>
+    </span>
+  {% endif %}
+  {% for v in f.td %}{{ pill('TD', 'td', v) }}{% endfor %}
+  {% for v in f.party %}{{ pill('Party', 'party', v) }}{% endfor %}
+  {% for v in f.constituency %}{{ pill('Constituency', 'constituency', v) }}{% endfor %}
+  {% for v in f.dept %}{{ pill('Dept', 'dept', v) }}{% endfor %}
+  {% for v in f.topic %}{{ pill('Topic', 'topic', v) }}{% endfor %}
+  {% for v in f.tag %}{{ pill('Tag', 'tag', v) }}{% endfor %}
+  {% for v in f.status %}{{ pill('Status', 'status', v) }}{% endfor %}
+  {% if f['from'] or f.to %}
+    <span class="pill" data-remove-key="date" data-remove-value="">
+      <span class="pill-label">Date asked:</span>
+      {{ f['from'] or '—' }} to {{ f.to or '—' }}
+      <button type="button" class="pill-x" aria-label="Remove">&times;</button>
+    </span>
+  {% endif %}
+  {% if f.from_ans or f.to_ans %}
+    <span class="pill" data-remove-key="date_answered" data-remove-value="">
+      <span class="pill-label">Date answered:</span>
+      {{ f.from_ans or '—' }} to {{ f.to_ans or '—' }}
+      <button type="button" class="pill-x" aria-label="Remove">&times;</button>
+    </span>
+  {% endif %}
+  {% if f.pqref %}{{ pill('PQ ref', 'pqref', f.pqref) }}{% endif %}
+  {% if f.constit %}{{ pill('Constituent', 'constit', f.constit) }}{% endif %}
+  {% if f.notes %}{{ pill('Notes', 'notes', f.notes) }}{% endif %}
+  <a href="{{ url_for('list_view') }}" class="active-filters-clear">Clear all</a>
+</div>
+{% endif %}
+
+{% macro sort_arrow(col) -%}
+  {% if f.sort == col %}<span class="sort-arrow {{ f.dir }}">{% if f.dir == 'asc' %}▲{% else %}▼{% endif %}</span>
+  {%- elif not f.sort and col == 'date_asked' %}<span class="sort-arrow desc default-sort" title="Default sort: date desc">▼</span>
+  {%- endif %}
+{%- endmacro %}
+
+{# Reusable funnel-icon SVG for filter buttons. #}
+{% macro funnel() -%}
+<svg class="funnel" viewBox="0 0 14 14" width="11" height="11" fill="none"
+     stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+     stroke-linecap="round" aria-hidden="true">
+  <path d="M1.5 2.5 L12.5 2.5 L8.5 7.5 L8.5 11.5 L5.5 11.5 L5.5 7.5 Z"/>
+</svg>
+{%- endmacro %}
+
+<table class="grid">
+  <thead>
+    <tr>
+      <th class="th-sortable th-filterable col col-pq_ref {% if f.sort == 'pq_ref' %}sorted{% endif %} {% if f.pqref %}filtered{% endif %}" data-col="pq_ref">
+        <span class="th-sort" data-sort="pq_ref">PQ ref {{ sort_arrow('pq_ref') }}</span>
+        <button type="button" class="th-filter" data-filter="pqref" data-filter-type="text" aria-label="Filter by PQ ref">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-date_asked {% if f.sort == 'date_asked' %}sorted{% endif %} {% if f['from'] or f.to %}filtered{% endif %}" data-col="date_asked">
+        <span class="th-sort" data-sort="date_asked">Date {{ sort_arrow('date_asked') }}</span>
+        <button type="button" class="th-filter" data-filter="date" data-filter-type="date" aria-label="Filter by date">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-td_name {% if f.sort == 'td_name' %}sorted{% endif %} {% if f.td or f.party or f.constituency %}filtered{% endif %}" data-col="td_name"
+          title="Click 'TD' to sort by name. Funnel opens TD / Party / Constituency filter.">
+        <span class="th-sort" data-sort="td_name">TD {{ sort_arrow('td_name') }}</span>
+        <button type="button" class="th-filter" data-filter="td-all" data-filter-type="td-all" aria-label="Filter by TD, party, or constituency">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-department {% if f.sort == 'department' %}sorted{% endif %} {% if f.dept %}filtered{% endif %}" data-col="department">
+        <span class="th-sort" data-sort="department">Dept {{ sort_arrow('department') }}</span>
+        <button type="button" class="th-filter" data-filter="dept" data-filter-type="categorical" aria-label="Filter by department">{{ funnel() }}</button>
+      </th>
+      <th class="th-filterable col col-topics_tags {% if f.topic or f.tag %}filtered{% endif %}" data-col="topics_tags"
+          title="Funnel opens Topics + Tags filter.">
+        Topics &amp; tags
+        <button type="button" class="th-filter" data-filter="topic-tag" data-filter-type="topic-tag" aria-label="Filter by topic or tag">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-answer_status {% if f.sort == 'answer_status' %}sorted{% endif %} {% if f.status %}filtered{% endif %}" data-col="answer_status">
+        <span class="th-sort" data-sort="answer_status">Status {{ sort_arrow('answer_status') }}</span>
+        <button type="button" class="th-filter" data-filter="status" data-filter-type="categorical" aria-label="Filter by status">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-date_answered {% if f.sort == 'date_answered' %}sorted{% endif %} {% if f.from_ans or f.to_ans %}filtered{% endif %}" data-col="date_answered">
+        <span class="th-sort" data-sort="date_answered">Date answered {{ sort_arrow('date_answered') }}</span>
+        <button type="button" class="th-filter" data-filter="date_answered" data-filter-type="date" aria-label="Filter by date answered">{{ funnel() }}</button>
+      </th>
+      <th class="col col-question_text {% if f.q %}filtered{% endif %}" data-col="question_text">
+        Question
+        <button type="button" class="th-search" id="search-btn"
+                aria-label="Search question and answer text"
+                title="Search PQs by text or meaning">
+          <svg class="search-icon" viewBox="0 0 14 14" width="12" height="12" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+            <circle cx="6" cy="6" r="3.5"/>
+            <path d="M8.6 8.6 L12.5 12.5"/>
+          </svg>
+        </button>
+      </th>
+      <th class="th-sortable th-filterable col col-constituent {% if f.sort == 'constituent' %}sorted{% endif %} {% if f.constit %}filtered{% endif %}" data-col="constituent">
+        <span class="th-sort" data-sort="constituent">Constituent {{ sort_arrow('constituent') }}</span>
+        <button type="button" class="th-filter" data-filter="constit" data-filter-type="text" aria-label="Filter by constituent">{{ funnel() }}</button>
+      </th>
+      <th class="th-sortable th-filterable col col-notes {% if f.sort == 'notes' %}sorted{% endif %} {% if f.notes %}filtered{% endif %}" data-col="notes">
+        <span class="th-sort" data-sort="notes">Notes {{ sort_arrow('notes') }}</span>
+        <button type="button" class="th-filter" data-filter="notes" data-filter-type="text" aria-label="Filter by notes contents">{{ funnel() }}</button>
+      </th>
+    </tr>
+  </thead>
+  <tbody id="rows">
+    {% for r in rows %}
+    <tr class="clickable" data-pqref="{{ r.pq_ref }}">
+      <td class="pq-ref col col-pq_ref" data-col="pq_ref"><a href="{{ url_for('detail_view', pq_ref=r.pq_ref) }}"
+                            onclick="event.stopPropagation();">{{ r.pq_ref }}</a></td>
+      <td class="col col-date_asked" data-col="date_asked">{{ r.date_asked }}</td>
+      <td class="col col-td_name td-cell" data-col="td_name">
+        <div class="td-line1">
+          <span class="td-name">{{ r.td_name }}</span>
+          {% if r.td_party %}<span class="party-chip" title="{{ r.td_party }}">{{ party_abbrev(r.td_party) }}</span>{% endif %}
+        </div>
+        {% if r.td_constituency %}<div class="td-constituency">{{ r.td_constituency }}</div>{% endif %}
+      </td>
+      <td class="col col-department" data-col="department">{{ r.department }}</td>
+      <td class="cell-chips col col-topics_tags" data-col="topics_tags">
+        {% for t in r.matched_topics_list %}<span class="chip">{{ t }}</span>{% endfor %}
+        {% for t in r.tags %}<span class="chip chip-tag">{{ t }}</span>{% endfor %}
+      </td>
+      <td class="col col-answer_status" data-col="answer_status"><span class="status-{{ r.answer_status }}">{{ r.answer_status }}</span></td>
+      <td class="col col-date_answered" data-col="date_answered">{{ r.date_answered or '' }}</td>
+      <td class="col col-question_text" data-col="question_text">
+        <div class="q-cell">
+          {% if r.hse_pdf_id %}
+            <button type="button" class="hse-icon" title="View HSE response PDF"
+                    data-hse-pdf="{{ r.hse_pdf_id }}">
+              <svg viewBox="0 0 14 16" width="12" height="14" fill="none" stroke="currentColor"
+                   stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                <path d="M2.5 1.5 H8.5 L11.5 4.5 V14.5 H2.5 Z"/>
+                <path d="M8.5 1.5 V4.5 H11.5"/>
+              </svg>
+            </button>
+          {% else %}
+            <span class="hse-icon hse-icon-empty" aria-hidden="true"></span>
+          {% endif %}
+          <div class="truncate">{{ r.question_text }}</div>
+        </div>
+      </td>
+      <td class="cell-constituent col col-constituent" data-col="constituent">{{ r.constituent or '' }}</td>
+      <td class="cell-notes col col-notes" data-col="notes">{% if r.notes %}<span title="{{ r.notes }}">●</span>{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:30px;">No matching questions.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if total_pages > 1 %}
+<div class="pagination">
+  {% if page > 1 %}
+    <a class="btn secondary" href="{{ url_for('list_view', **dict(request.args, page=page-1)) }}">&larr; Prev</a>
+  {% endif %}
+  <span style="color:var(--muted);">Page {{ page }} of {{ total_pages }}</span>
+  {% if page < total_pages %}
+    <a class="btn secondary" href="{{ url_for('list_view', **dict(request.args, page=page+1)) }}">Next &rarr;</a>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Modal -->
+<div class="modal-backdrop" id="modal" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="m-title">PQ —</h2>
+      <button class="close" type="button" aria-label="Close" data-close>&times;</button>
+    </div>
+    <div class="modal-body">
+      <section>
+        <h3>Question</h3>
+        <div class="qa-body" id="m-question"></div>
+      </section>
+
+      <section>
+        <div class="summary-strip" id="m-summary">
+          <div class="summary-row">
+            <span><span class="sk">Asked</span> <span id="m-date-asked"></span></span>
+            <span><span class="sk">Answered</span> <span id="m-date-answered"></span></span>
+            <span><span class="sk">TD</span> <span id="m-td"></span></span>
+          </div>
+          <div class="summary-row">
+            <span><span class="sk">Dept</span> <span id="m-dept"></span></span>
+            <span><span class="sk">Minister</span> <span id="m-minister"></span></span>
+            <span><span class="sk">Status</span> <span id="m-status"></span></span>
+            <span><span class="sk">Topics</span> <span id="m-topics"></span></span>
+            <span><a id="m-permalink" target="_blank" rel="noopener">Permalink &#x2197;</a></span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h3>Answer</h3>
+        <div class="qa-body" id="m-answer"></div>
+      </section>
+
+      <section>
+        <h3>HSE response PDFs</h3>
+        <div id="m-hse-pdfs" style="font-size:13px;"></div>
+      </section>
+
+      <section>
+        <label style="display:block;margin-bottom:10px;">
+          <span style="font-size:12px;color:var(--muted);">Tags
+            <span style="opacity:0.7;">— type and press Enter or comma. Backspace to remove the last chip.</span>
+          </span>
+          <div class="tag-editor" id="m-tagedit">
+            <input id="m-taginput" type="text" placeholder="add a tag…" autocomplete="off">
+            <div class="tag-suggest" id="m-tagsuggest"></div>
+          </div>
+        </label>
+        <div style="display:grid;grid-template-columns:1fr 2fr;gap:12px;">
+          <label style="display:block;">
+            <span style="font-size:12px;color:var(--muted);">Constituent</span>
+            <input id="m-constituent" type="text"
+                   placeholder="who prompted this PQ (e.g. Anne Doyle, Drogheda)">
+          </label>
+          <label style="display:block;">
+            <span style="font-size:12px;color:var(--muted);">Notes</span>
+            <textarea id="m-notes" rows="2" placeholder="Free-form notes for your own use."></textarea>
+          </label>
+        </div>
+      </section>
+    </div>
+    <div class="modal-foot">
+      <span class="status" id="m-status-msg"></span>
+      <button class="btn secondary" type="button" data-close>Close</button>
+      <button class="btn" type="button" id="m-save">Save</button>
+    </div>
+  </div>
+</div>
+
+{# Search modal — opened by the 🔍 icon on the Question column header. #}
+<div class="modal-backdrop" id="search-modal" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="modal modal-narrow">
+    <div class="modal-head">
+      <h2>Search PQs</h2>
+      <button class="close" type="button" aria-label="Close" data-search-close>&times;</button>
+    </div>
+    <div class="modal-body">
+      <input id="search-q" type="text"
+             class="searchbar-input"
+             placeholder='diabetes &middot; "home help hours" &middot; diab* &middot; how long do kids wait for CAMHS?'>
+      <div class="searchbar-row" style="margin-top:10px;">
+        <span class="searchbar-label">Search in:</span>
+        <label class="cb"><input id="search-d-question" type="checkbox" value="question" checked> Question</label>
+        <label class="cb"><input id="search-d-answer" type="checkbox" value="answer" checked> Answer</label>
+        <label class="cb cb-disabled" title="Coming in Phase 2 once HSE PDF text extraction is built.">
+          <input type="checkbox" disabled> HSE PDFs <span class="muted-tag">(Phase 2)</span>
+        </label>
+      </div>
+      <details class="searchbar-advanced" id="search-advanced">
+        <summary>Advanced</summary>
+        <div class="searchbar-row">
+          <span class="searchbar-label">Indexes:</span>
+          <label class="cb"><input id="search-i-lex" type="checkbox" value="lex" checked> Lexical (BM25, stemmed)</label>
+          <label class="cb"><input id="search-i-sem" type="checkbox" value="sem" checked> Semantic (BGE)</label>
+          <span class="muted-help">Applies to all selected domains.</span>
+        </div>
+      </details>
+      <p style="color:var(--muted);font-size:12px;margin:12px 0 0;">
+        Quote for phrases (<code>"home help hours"</code>). Append <code>*</code> for prefix
+        (<code>diab*</code>). Empty search = browse without ranking.
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn secondary" type="button" id="search-clear">Clear search</button>
+      <button class="btn secondary" type="button" data-search-close>Cancel</button>
+      <button class="btn" type="button" id="search-apply">Search</button>
+    </div>
+  </div>
+</div>
+
+{# HSE PDF preview modal — opened by the 📄 icon on the Question column. #}
+<div class="modal-backdrop" id="hse-modal" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="modal modal-pdf">
+    <div class="modal-head">
+      <h2 id="hse-modal-title">HSE PDF</h2>
+      <span style="flex:1;"></span>
+      <a id="hse-modal-newtab" href="#" target="_blank" rel="noopener"
+         class="btn secondary" style="margin-right:8px;">Open in new tab</a>
+      <button class="close" type="button" aria-label="Close" data-hse-close>&times;</button>
+    </div>
+    <div class="modal-body" style="padding:0; max-height:none;">
+      <iframe id="hse-modal-frame" title="HSE PDF preview"
+              style="width:100%; height:80vh; border:0; display:block;"></iframe>
+    </div>
+  </div>
+</div>
+
+<script>
+// HSE PDF modal: open when a row's 📄 icon is clicked.
+(function () {
+  const hModal = document.getElementById('hse-modal');
+  const hFrame = document.getElementById('hse-modal-frame');
+  const hNewTab = document.getElementById('hse-modal-newtab');
+  function openPdf(pdfId) {
+    const url = '/hse-pdf/' + encodeURIComponent(pdfId);
+    hFrame.src = url;
+    hNewTab.href = url;
+    hModal.classList.add('open');
+    hModal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
+  }
+  function closePdf() {
+    hModal.classList.remove('open');
+    hModal.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+    hFrame.src = 'about:blank';
+  }
+  document.getElementById('rows').addEventListener('click', function (e) {
+    const btn = e.target.closest('.hse-icon[data-hse-pdf]');
+    if (!btn) return;
+    // Stop the sibling row-click listener (also bound to #rows) from opening
+    // the PQ modal when we just wanted to preview the PDF.
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    openPdf(btn.getAttribute('data-hse-pdf'));
+  });
+  hModal.addEventListener('click', function (e) {
+    if (e.target === hModal || e.target.hasAttribute('data-hse-close')) closePdf();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && hModal.classList.contains('open')) closePdf();
+  });
+})();
+</script>
+
+<script>
+(function () {
+  const modal = document.getElementById('modal');
+  const title = document.getElementById('m-title');
+  const els = {
+    dateAsked: document.getElementById('m-date-asked'),
+    dateAnswered: document.getElementById('m-date-answered'),
+    td: document.getElementById('m-td'),
+    dept: document.getElementById('m-dept'),
+    minister: document.getElementById('m-minister'),
+    status: document.getElementById('m-status'),
+    topics: document.getElementById('m-topics'),
+    permalink: document.getElementById('m-permalink'),
+    question: document.getElementById('m-question'),
+    answer: document.getElementById('m-answer'),
+    constituent: document.getElementById('m-constituent'),
+    notes: document.getElementById('m-notes'),
+    msg: document.getElementById('m-status-msg'),
+    tagEdit: document.getElementById('m-tagedit'),
+    tagInput: document.getElementById('m-taginput'),
+    tagSuggest: document.getElementById('m-tagsuggest'),
+    hsePdfs: document.getElementById('m-hse-pdfs'),
+  };
+  let currentRef = null;
+  let currentRowEl = null;
+  let currentTags = [];           // chips active for this PQ
+  let allTagsCache = [];          // sorted distinct list, refreshed on modal open
+  let activeSuggestIdx = -1;
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+
+  function renderHsePdfs(pdfs) {
+    if (!pdfs || !pdfs.length) {
+      els.hsePdfs.innerHTML = '<span style="color:var(--muted);">No HSE PDF matched for this PQ ref.</span>';
+      return;
+    }
+    const rows = pdfs.map(function (p) {
+      const sourceLabel = p.source === 'hse_live' ? 'live HSE site' : 'Wayback archive';
+      const localLink = p.local_path
+        ? '<a href="/hse-pdf/' + p.id + '" target="_blank" rel="noopener">local copy</a>'
+        : '<span style="color:var(--muted);">no local copy yet</span>';
+      const pubDate = p.publication_date ? ' &middot; ' + escapeHtml(p.publication_date) : '';
+      return '<div style="margin:4px 0;">'
+        + '<span style="color:var(--muted);font-size:11px;">' + sourceLabel + pubDate + '</span><br>'
+        + '<a href="' + encodeURI(p.source_url) + '" target="_blank" rel="noopener">' + escapeHtml(p.filename) + '</a>'
+        + ' &middot; ' + localLink
+        + '</div>';
+    });
+    els.hsePdfs.innerHTML = rows.join('');
+  }
+
+  function setMsg(text, isError) {
+    els.msg.textContent = text || '';
+    els.msg.classList.toggle('error', !!isError);
+  }
+
+  // --- tag editor ---
+
+  function renderTags() {
+    // Remove existing chip elements (before input).
+    Array.from(els.tagEdit.querySelectorAll('.chip-tag')).forEach(function (c) { c.remove(); });
+    currentTags.forEach(function (t, i) {
+      const span = document.createElement('span');
+      span.className = 'chip chip-tag';
+      span.dataset.idx = i;
+      span.innerHTML = escapeHtml(t) + '<span class="x" data-remove="' + i + '">&times;</span>';
+      els.tagEdit.insertBefore(span, els.tagInput);
+    });
+  }
+
+  function addTag(raw) {
+    const t = (raw || '').trim();
+    if (!t) return;
+    // case-insensitive dedup
+    const exists = currentTags.some(function (x) { return x.toLowerCase() === t.toLowerCase(); });
+    if (exists) return;
+    currentTags.push(t);
+    renderTags();
+    refreshSuggestions('');
+  }
+
+  function removeTagAt(i) {
+    currentTags.splice(i, 1);
+    renderTags();
+  }
+
+  function refreshSuggestions(query) {
+    const q = (query || '').trim().toLowerCase();
+    const taken = new Set(currentTags.map(function (t) { return t.toLowerCase(); }));
+    const matches = allTagsCache.filter(function (t) {
+      if (taken.has(t.toLowerCase())) return false;
+      if (!q) return true;
+      return t.toLowerCase().includes(q);
+    }).slice(0, 8);
+    if (!matches.length) {
+      els.tagSuggest.classList.remove('open');
+      els.tagSuggest.innerHTML = '';
+      activeSuggestIdx = -1;
+      return;
+    }
+    els.tagSuggest.innerHTML = matches.map(function (t, i) {
+      return '<div data-suggest="' + escapeHtml(t) + '"' + (i === 0 ? ' class="active"' : '') + '>' + escapeHtml(t) + '</div>';
+    }).join('');
+    els.tagSuggest.classList.add('open');
+    activeSuggestIdx = 0;
+  }
+
+  function setActiveSuggest(idx) {
+    const items = els.tagSuggest.querySelectorAll('div');
+    if (!items.length) return;
+    activeSuggestIdx = Math.max(0, Math.min(idx, items.length - 1));
+    items.forEach(function (it, i) { it.classList.toggle('active', i === activeSuggestIdx); });
+  }
+
+  // tag-editor event wiring
+  els.tagEdit.addEventListener('click', function (e) {
+    const rm = e.target.getAttribute && e.target.getAttribute('data-remove');
+    if (rm !== null && rm !== undefined) {
+      removeTagAt(parseInt(rm, 10));
+      els.tagInput.focus();
+      return;
+    }
+    els.tagInput.focus();
+  });
+  els.tagInput.addEventListener('input', function () {
+    refreshSuggestions(els.tagInput.value);
+  });
+  els.tagInput.addEventListener('focus', function () {
+    refreshSuggestions(els.tagInput.value);
+  });
+  els.tagInput.addEventListener('blur', function () {
+    // Small delay so click handlers on suggestions fire first.
+    setTimeout(function () { els.tagSuggest.classList.remove('open'); }, 120);
+  });
+  els.tagInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      // Prefer the highlighted suggestion if the popup is open and matches input.
+      const items = els.tagSuggest.querySelectorAll('div');
+      if (els.tagSuggest.classList.contains('open') && items.length && els.tagInput.value.trim()) {
+        addTag(items[activeSuggestIdx].dataset.suggest);
+      } else {
+        addTag(els.tagInput.value);
+      }
+      els.tagInput.value = '';
+    } else if (e.key === 'Backspace' && !els.tagInput.value && currentTags.length) {
+      removeTagAt(currentTags.length - 1);
+    } else if (e.key === 'ArrowDown' && els.tagSuggest.classList.contains('open')) {
+      e.preventDefault();
+      setActiveSuggest(activeSuggestIdx + 1);
+    } else if (e.key === 'ArrowUp' && els.tagSuggest.classList.contains('open')) {
+      e.preventDefault();
+      setActiveSuggest(activeSuggestIdx - 1);
+    } else if (e.key === 'Escape' && els.tagSuggest.classList.contains('open')) {
+      e.preventDefault();
+      e.stopPropagation();
+      els.tagSuggest.classList.remove('open');
+    }
+  });
+  els.tagSuggest.addEventListener('mousedown', function (e) {
+    const t = e.target.getAttribute && e.target.getAttribute('data-suggest');
+    if (t) {
+      e.preventDefault();
+      addTag(t);
+      els.tagInput.value = '';
+      els.tagInput.focus();
+    }
+  });
+
+  // --- modal ---
+
+  function open(pqRef, rowEl) {
+    currentRef = pqRef;
+    currentRowEl = rowEl;
+    currentTags = [];
+    setMsg('Loading...', false);
+    title.textContent = 'PQ ' + pqRef;
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
+    // Forward active search so the API returns <mark>-highlighted bodies.
+    let pqUrl = '/api/pq/' + encodeURIComponent(pqRef);
+    if (FILTER_CURRENT.q) {
+      const sp = new URLSearchParams();
+      sp.append('q', FILTER_CURRENT.q);
+      (FILTER_CURRENT.domains || []).forEach(function (d) { sp.append('d', d); });
+      (FILTER_CURRENT.indexes || []).forEach(function (i) { sp.append('i', i); });
+      pqUrl += '?' + sp.toString();
+    }
+    // Refresh autocomplete data each open so new tags appear right away.
+    Promise.all([
+      fetch(pqUrl).then(function (r) { return r.json(); }),
+      fetch('/api/tags').then(function (r) { return r.json(); }),
+    ]).then(function (results) {
+      allTagsCache = results[1] || [];
+      populate(results[0]);
+    }).catch(function (e) {
+      setMsg('Could not load: ' + e.message, true);
+    });
+  }
+
+  function close() {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+    currentRef = null;
+    currentRowEl = null;
+  }
+
+  function populate(row) {
+    els.dateAsked.textContent = row.date_asked || '—';
+    els.dateAnswered.textContent = row.date_answered || 'pending';
+    let td = row.td_name || '';
+    if (row.td_party) td += ' (' + row.td_party + ')';
+    if (row.td_constituency) td += ' · ' + row.td_constituency;
+    els.td.textContent = td;
+    els.dept.textContent = row.department || '—';
+    els.minister.textContent = row.minister_name || '—';
+    els.status.innerHTML = '<span class="status-' + row.answer_status + '">' + row.answer_status + '</span>';
+    els.topics.innerHTML = (row.matched_topics_list || []).map(function (t) {
+      return '<span class="chip">' + escapeHtml(t) + '</span>';
+    }).join(' ') || '<span style="color:var(--muted);">—</span>';
+    els.permalink.href = row.oireachtas_permalink || '#';
+    if (row.question_html) {
+      els.question.innerHTML = row.question_html;
+    } else {
+      els.question.textContent = row.question_text || '';
+    }
+    if (row.answer_html) {
+      els.answer.innerHTML = row.answer_html;
+    } else {
+      els.answer.textContent = row.answer_text || '(answer not yet published)';
+    }
+    els.constituent.value = row.constituent || '';
+    els.notes.value = row.notes || '';
+    renderHsePdfs(row.hse_pdfs || []);
+    currentTags = (row.tags || []).slice();
+    els.tagInput.value = '';
+    renderTags();
+    setMsg('');
+    els.constituent.focus();
+  }
+
+  function save() {
+    if (!currentRef) return;
+    // Commit any uncommitted tag text in the input.
+    if (els.tagInput.value.trim()) {
+      addTag(els.tagInput.value);
+      els.tagInput.value = '';
+    }
+    setMsg('Saving...', false);
+    const payload = {
+      constituent: els.constituent.value,
+      notes: els.notes.value,
+      tags: currentTags,
+    };
+    fetch('/api/pq/' + encodeURIComponent(currentRef), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (data) {
+        setMsg('Saved at ' + new Date().toLocaleTimeString(), false);
+        // Add any new tag to the local autocomplete cache.
+        (data.row.tags || []).forEach(function (t) {
+          if (!allTagsCache.some(function (x) { return x.toLowerCase() === t.toLowerCase(); })) {
+            allTagsCache.push(t);
+          }
+        });
+        allTagsCache.sort(function (a, b) { return a.toLowerCase().localeCompare(b.toLowerCase()); });
+        // Update the row in place.
+        if (currentRowEl) {
+          const cCell = currentRowEl.querySelector('.cell-constituent');
+          const nCell = currentRowEl.querySelector('.cell-notes');
+          const chCell = currentRowEl.querySelector('.cell-chips');
+          if (cCell) cCell.textContent = data.row.constituent || '';
+          if (nCell) {
+            nCell.innerHTML = data.row.notes
+              ? '<span title="' + escapeHtml(data.row.notes) + '">●</span>' : '';
+          }
+          if (chCell) {
+            const topicHtml = (data.row.matched_topics_list || []).map(function (t) {
+              return '<span class="chip">' + escapeHtml(t) + '</span>';
+            }).join('');
+            const tagHtml = (data.row.tags || []).map(function (t) {
+              return '<span class="chip chip-tag">' + escapeHtml(t) + '</span>';
+            }).join('');
+            chCell.innerHTML = topicHtml + tagHtml;
+          }
+        }
+      })
+      .catch(function (e) { setMsg('Save failed: ' + e.message, true); });
+  }
+
+  // Row click opens modal (but anchor clicks inside row are still followed).
+  document.getElementById('rows').addEventListener('click', function (e) {
+    const tr = e.target.closest('tr.clickable');
+    if (!tr) return;
+    if (e.target.closest('a')) return;
+    open(tr.dataset.pqref, tr);
+  });
+
+  // Close handlers: backdrop click, X button, Esc.
+  modal.addEventListener('click', function (e) {
+    if (e.target === modal || e.target.hasAttribute('data-close')) close();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && modal.classList.contains('open')
+        && !els.tagSuggest.classList.contains('open')) close();
+    if ((e.key === 's' || e.key === 'S') && (e.ctrlKey || e.metaKey) && modal.classList.contains('open')) {
+      e.preventDefault();
+      save();
+    }
+  });
+  document.getElementById('m-save').addEventListener('click', save);
+})();
+</script>
+
+{# Popover container (single instance, repositioned on each open). #}
+<div id="hdr-popover" class="hdr-popover" hidden>
+  <div class="hdr-popover-body"></div>
+</div>
+
+<script>
+// Option lists for categorical filters. Rendered server-side from the same
+// distinct_values() queries that used to populate the old <select> dropdowns.
+const FILTER_OPTIONS = {
+  td: {{ tds|tojson }},
+  party: {{ parties|tojson }},
+  constituency: {{ constituencies|tojson }},
+  dept: {{ depts|tojson }},
+  topic: {{ topics|tojson }},
+  tag: {{ all_tags|tojson }},
+  status: ["pending", "answered"],
+};
+
+// Currently-applied filter values (mirror of f.* — what to pre-check in popovers).
+const FILTER_CURRENT = {
+  td: {{ f.td|tojson }},
+  party: {{ f.party|tojson }},
+  constituency: {{ f.constituency|tojson }},
+  dept: {{ f.dept|tojson }},
+  topic: {{ f.topic|tojson }},
+  tag: {{ f.tag|tojson }},
+  status: {{ f.status|tojson }},
+  from: {{ f['from']|tojson }},
+  to: {{ f.to|tojson }},
+  from_ans: {{ f.from_ans|tojson }},
+  to_ans: {{ f.to_ans|tojson }},
+  pqref: {{ f.pqref|tojson }},
+  constit: {{ f.constit|tojson }},
+  notes: {{ f.notes|tojson }},
+  q: {{ f.q|tojson }},
+  domains: {{ f.domains|list|tojson }},
+  indexes: {{ f.indexes|list|tojson }},
+};
+
+const FILTER_LABEL = {
+  td: "TD", party: "Party", constituency: "Constituency",
+  dept: "Department", topic: "Topic", tag: "Tag", status: "Status",
+};
+
+(function () {
+  // Helpers ----------------------------------------------------------------
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+
+  // Build a URL from a params object. Lists become repeated keys.
+  function buildUrl(params) {
+    const u = new URLSearchParams();
+    Object.entries(params).forEach(function ([k, v]) {
+      if (v === null || v === undefined || v === "") return;
+      if (Array.isArray(v)) v.forEach(function (x) { if (x) u.append(k, x); });
+      else u.append(k, v);
+    });
+    const qs = u.toString();
+    return window.location.pathname + (qs ? '?' + qs : '');
+  }
+
+  // Read the current URL into a params object that mirrors how the server
+  // parses the request — repeated keys → arrays, single → string.
+  function currentParams() {
+    const u = new URLSearchParams(window.location.search);
+    const out = {};
+    for (const k of u.keys()) {
+      const all = u.getAll(k);
+      out[k] = all.length > 1 ? all : all[0];
+    }
+    // Coerce the multi-select filter keys to arrays even if only one value.
+    ['td','party','constituency','dept','topic','tag','status','d','i'].forEach(function (k) {
+      if (k in out && !Array.isArray(out[k])) out[k] = [out[k]];
+    });
+    return out;
+  }
+
+  function navigate(params) { window.location.href = buildUrl(params); }
+
+  // Sort -------------------------------------------------------------------
+  // Click cycles ASC → DESC → cleared.
+  document.querySelectorAll('.th-sort').forEach(function (el) {
+    el.addEventListener('click', function (e) {
+      e.stopPropagation();
+      const col = el.dataset.sort;
+      const params = currentParams();
+      const curSort = params.sort || '';
+      const curDir = params.dir || '';
+      if (curSort !== col) {
+        params.sort = col; params.dir = 'asc';
+      } else if (curDir === 'asc') {
+        params.dir = 'desc';
+      } else {
+        delete params.sort; delete params.dir;
+      }
+      navigate(params);
+    });
+  });
+
+  // Popover ----------------------------------------------------------------
+  const pop = document.getElementById('hdr-popover');
+  const popBody = pop.querySelector('.hdr-popover-body');
+
+  function openPopover(anchor, html) {
+    popBody.innerHTML = html;
+    pop.hidden = false;
+    // Position below the anchor, aligned to its left edge, clamped to viewport.
+    const r = anchor.getBoundingClientRect();
+    pop.style.top = (r.bottom + window.scrollY + 4) + 'px';
+    let left = r.left + window.scrollX;
+    const popWidth = pop.offsetWidth;
+    const maxLeft = window.scrollX + window.innerWidth - popWidth - 8;
+    if (left > maxLeft) left = Math.max(8, maxLeft);
+    pop.style.left = left + 'px';
+    // Focus the first input/search box for keyboard use.
+    const focusable = pop.querySelector('input,button');
+    if (focusable) focusable.focus();
+  }
+
+  function closePopover() {
+    pop.hidden = true;
+    popBody.innerHTML = '';
+  }
+
+  // Single-axis categorical popover (Party, Dept, Status, …) — head/search/list
+  // stacked with Apply + Clear underneath.
+  function renderCategorical(key) {
+    return ''
+      + renderCategoricalColumn(key, /*withClear=*/false)
+      + '<div class="pop-actions">'
+      + '  <button type="button" class="btn secondary pop-clear" data-clear="' + key + '">Clear</button>'
+      + '  <button type="button" class="btn pop-apply" data-apply="' + key + '">Apply</button>'
+      + '</div>';
+  }
+
+  // Column-shaped categorical block for horizontal composite popovers
+  // (TD + Party + Constituency, Topic + Tag). Per-axis Clear lives in the
+  // column header; one shared Apply button sits below the whole row.
+  function renderCategoricalColumn(key, withClear) {
+    const opts = FILTER_OPTIONS[key] || [];
+    const checked = new Set(FILTER_CURRENT[key] || []);
+    const label = FILTER_LABEL[key] || key;
+    const clearBtn = withClear
+      ? '<button type="button" class="pop-col-clear" data-clear="' + key + '">clear</button>'
+      : '';
+    return ''
+      + '<div class="pop-col">'
+      + '  <div class="pop-head">' + escHtml(label) + clearBtn + '</div>'
+      + '  <input type="text" class="pop-search" placeholder="Search…">'
+      + '  <div class="pop-list" data-filter-key="' + key + '">'
+      + opts.map(function (v) {
+          const c = checked.has(v) ? ' checked' : '';
+          return '<label class="pop-item"><input type="checkbox" value="'
+            + escHtml(v) + '"' + c + '> ' + escHtml(v) + '</label>';
+        }).join('')
+      + '  </div>'
+      + '</div>';
+  }
+
+  function renderDateRange(filterKey) {
+    // filterKey is 'date' (date_asked, via ?from/?to) or
+    // 'date_answered' (?from_ans/?to_ans). Same UI, different state keys.
+    const isAns = filterKey === 'date_answered';
+    const fromCur = isAns ? FILTER_CURRENT.from_ans : FILTER_CURRENT.from;
+    const toCur   = isAns ? FILTER_CURRENT.to_ans   : FILTER_CURRENT.to;
+    const today = new Date().toISOString().slice(0, 10);
+    const from = fromCur || '';
+    const to = toCur || today;  // Default "to" to today on blank state.
+    const head = isAns ? 'Date answered' : 'Date asked';
+    return ''
+      + '<div class="pop-head">' + head + '</div>'
+      + '<label class="pop-date-row"><span>From</span>'
+      + '  <input type="date" class="pop-from" value="' + escHtml(from) + '"></label>'
+      + '<label class="pop-date-row"><span>To</span>'
+      + '  <input type="date" class="pop-to" value="' + escHtml(to) + '" max="' + today + '"></label>'
+      + '<div class="pop-actions">'
+      + '  <button type="button" class="btn secondary pop-clear" data-clear="' + filterKey + '">Clear</button>'
+      + '  <button type="button" class="btn pop-apply" data-apply="' + filterKey + '">Apply</button>'
+      + '</div>';
+  }
+
+  // Text-substring filter (PQ ref / Constituent / Notes).
+  function renderText(filterKey) {
+    const labels = {pqref: 'PQ ref contains', constit: 'Constituent contains', notes: 'Notes contain'};
+    const placeholders = {pqref: 'e.g. 33698 or 33698/26', constit: 'e.g. Anne Doyle', notes: 'e.g. follow-up'};
+    const cur = FILTER_CURRENT[filterKey] || '';
+    return ''
+      + '<div class="pop-head">' + (labels[filterKey] || filterKey) + '</div>'
+      + '<input type="text" class="pop-text" value="' + escHtml(cur)
+      + '" placeholder="' + escHtml(placeholders[filterKey] || '') + '" autofocus>'
+      + '<div class="pop-actions">'
+      + '  <button type="button" class="btn secondary pop-clear" data-clear="' + filterKey + '">Clear</button>'
+      + '  <button type="button" class="btn pop-apply" data-apply="' + filterKey + '">Apply</button>'
+      + '</div>';
+  }
+
+  // Composite popovers: TD column combines TD + Party + Constituency, since
+  // those three are now rendered in a single 2-line cell. Topics & tags is
+  // analogous (chip cell, two filter axes shown side-by-side). The axes lay
+  // out horizontally — each gets its own column with a per-axis "clear" and
+  // one shared Apply button below the row.
+  function renderHorizontalComposite(keys, applyKey) {
+    const cols = keys.map(function (k) { return renderCategoricalColumn(k, true); }).join('');
+    return ''
+      + '<div class="pop-row">' + cols + '</div>'
+      + '<div class="pop-actions">'
+      + '  <button type="button" class="btn pop-apply" data-apply="' + applyKey + '">Apply</button>'
+      + '</div>';
+  }
+  function renderTdAll() {
+    return renderHorizontalComposite(['td', 'party', 'constituency'], 'td-all');
+  }
+  function renderTopicTag() {
+    return renderHorizontalComposite(['topic', 'tag'], 'topic-tag');
+  }
+
+  // Wire ▾ filter buttons.
+  document.querySelectorAll('.th-filter').forEach(function (btn) {
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (!pop.hidden && pop.dataset.anchorKey === btn.dataset.filter) {
+        closePopover();
+        return;
+      }
+      pop.dataset.anchorKey = btn.dataset.filter;
+      const type = btn.dataset.filterType;
+      let html;
+      if (type === 'categorical') html = renderCategorical(btn.dataset.filter);
+      else if (type === 'date') html = renderDateRange(btn.dataset.filter);
+      else if (type === 'text') html = renderText(btn.dataset.filter);
+      else if (type === 'td-all') html = renderTdAll();
+      else if (type === 'topic-tag') html = renderTopicTag();
+      else return;
+      openPopover(btn, html);
+    });
+  });
+
+  // Popover interactions (event delegation).
+  popBody.addEventListener('input', function (e) {
+    if (e.target.classList.contains('pop-search')) {
+      const q = e.target.value.toLowerCase();
+      // Filter the *adjacent* pop-list. Composite popovers (td-constituency,
+      // topic-tag) have multiple search boxes; each filters the next sibling.
+      const list = e.target.parentElement.querySelector('.pop-list');
+      if (!list) return;
+      list.querySelectorAll('.pop-item').forEach(function (lbl) {
+        lbl.style.display = lbl.textContent.toLowerCase().includes(q) ? '' : 'none';
+      });
+    }
+  });
+
+  // Date-range filter keys carry two URL params each — central map keeps the
+  // apply/clear handler ignorant of the specific column.
+  const DATE_PARAMS = {
+    'date':           {from: 'from',     to: 'to'},
+    'date_answered':  {from: 'from_ans', to: 'to_ans'},
+  };
+
+  popBody.addEventListener('click', function (e) {
+    const clear = e.target.getAttribute('data-clear');
+    const apply = e.target.getAttribute('data-apply');
+    if (!clear && !apply) return;
+    const params = currentParams();
+    if (clear) {
+      if (DATE_PARAMS[clear]) {
+        delete params[DATE_PARAMS[clear].from];
+        delete params[DATE_PARAMS[clear].to];
+      } else {
+        delete params[clear];
+      }
+      delete params.page;
+      navigate(params);
+      return;
+    }
+    if (apply) {
+      if (DATE_PARAMS[apply]) {
+        const from = pop.querySelector('.pop-from').value;
+        const to = pop.querySelector('.pop-to').value;
+        const keys = DATE_PARAMS[apply];
+        if (from) params[keys.from] = from; else delete params[keys.from];
+        if (to) params[keys.to] = to; else delete params[keys.to];
+      } else if (pop.querySelector('.pop-text')) {
+        // Text-substring filter (PQ ref / Constituent / Notes).
+        const v = pop.querySelector('.pop-text').value.trim();
+        if (v) params[apply] = v; else delete params[apply];
+      } else {
+        // Read both possibly-present categorical lists in this popover.
+        // (For composite popovers, both lists are in the DOM; we update
+        // each separately.)
+        pop.querySelectorAll('.pop-list').forEach(function (list) {
+          const key = list.dataset.filterKey;
+          const vals = Array.from(list.querySelectorAll('input:checked'))
+            .map(function (i) { return i.value; });
+          if (vals.length) params[key] = vals; else delete params[key];
+        });
+      }
+      delete params.page;
+      navigate(params);
+    }
+  });
+
+  // Enter inside a text-substring filter input triggers Apply.
+  popBody.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    if (!e.target.classList.contains('pop-text')) return;
+    e.preventDefault();
+    const applyBtn = pop.querySelector('.pop-apply');
+    if (applyBtn) applyBtn.click();
+  });
+
+  // Pill ✕ — remove a single filter value, or the whole date-range pill.
+  document.querySelectorAll('#active-filters .pill-x').forEach(function (x) {
+    x.addEventListener('click', function (e) {
+      e.stopPropagation();  // don't re-open the search modal via pill-search.
+      const pill = e.target.closest('.pill');
+      const key = pill.dataset.removeKey;
+      const value = pill.dataset.removeValue;
+      const params = currentParams();
+      if (DATE_PARAMS[key]) {
+        delete params[DATE_PARAMS[key].from];
+        delete params[DATE_PARAMS[key].to];
+      } else if (Array.isArray(params[key])) {
+        params[key] = params[key].filter(function (v) { return v !== value; });
+        if (!params[key].length) delete params[key];
+      } else if (key in params) {
+        // Single-string filter (q, pqref, constit, notes) — just drop the key.
+        delete params[key];
+      }
+      delete params.page;
+      navigate(params);
+    });
+  });
+
+  // --- Column chooser -----------------------------------------------------
+  // 12 columns total. 6 are visible by default; any can be toggled off.
+  // Choices persist to localStorage. Bumping the v2 suffix resets every user
+  // because the default set changed (Status added; "required" dropped).
+  const COLS_ALL = [
+    {key: 'pq_ref',           label: 'PQ ref',                       on: true},
+    {key: 'date_asked',       label: 'Date asked',                   on: true},
+    {key: 'td_name',          label: 'TD (party · constituency)',    on: true},
+    {key: 'department',       label: 'Department',                   on: false},
+    {key: 'topics_tags',      label: 'Topics & tags',                on: true},
+    {key: 'answer_status',    label: 'Status',                       on: true},
+    {key: 'date_answered',    label: 'Date answered',                on: false},
+    {key: 'question_text',    label: 'Question',                     on: true},
+    {key: 'constituent',      label: 'Constituent',                  on: false},
+    {key: 'notes',            label: 'Notes',                        on: false},
+  ];
+  const COLS_DEFAULT_VISIBLE = new Set(
+    COLS_ALL.filter(function (c) { return c.on; }).map(function (c) { return c.key; })
+  );
+  // v3 — TD column absorbed Party + Constituency; reset existing prefs.
+  const COLS_STORAGE_KEY = 'pq-tracker:visible-columns:v3';
+
+  function loadVisibleCols() {
+    try {
+      const raw = localStorage.getItem(COLS_STORAGE_KEY);
+      if (!raw) return new Set(COLS_DEFAULT_VISIBLE);
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return new Set(COLS_DEFAULT_VISIBLE);
+      return new Set(arr);
+    } catch (e) { return new Set(COLS_DEFAULT_VISIBLE); }
+  }
+
+  function saveVisibleCols(set) {
+    try { localStorage.setItem(COLS_STORAGE_KEY, JSON.stringify(Array.from(set))); }
+    catch (e) { /* ignore */ }
+  }
+
+  function applyVisibleCols(set) {
+    document.querySelectorAll('.col').forEach(function (el) {
+      const visible = set.has(el.dataset.col);
+      el.style.display = visible ? '' : 'none';
+    });
+    // Recompute the empty-state row's colspan from the visible count.
+    const empty = document.querySelector('tbody#rows tr td[colspan]');
+    if (empty) empty.colSpan = set.size;
+  }
+
+  let visibleCols = loadVisibleCols();
+  applyVisibleCols(visibleCols);
+
+  function renderColsChooser() {
+    return ''
+      + '<div class="pop-head">Columns</div>'
+      + '<div class="pop-list" id="cols-list">'
+      + COLS_ALL.map(function (c) {
+          const checked = visibleCols.has(c.key) ? ' checked' : '';
+          return '<label class="pop-item">'
+            + '<input type="checkbox" data-col="' + c.key + '"' + checked + '> '
+            + escHtml(c.label) + '</label>';
+        }).join('')
+      + '</div>'
+      + '<div class="pop-actions">'
+      + '  <button type="button" class="btn secondary" id="cols-reset">Reset to default</button>'
+      + '</div>';
+  }
+
+  const colsBtn = document.getElementById('cols-btn');
+  if (colsBtn) {
+    colsBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (!pop.hidden && pop.dataset.anchorKey === '__cols__') {
+        closePopover();
+        return;
+      }
+      pop.dataset.anchorKey = '__cols__';
+      openPopover(colsBtn, renderColsChooser());
+    });
+  }
+
+  // Toggling a column checkbox inside the chooser updates state immediately.
+  popBody.addEventListener('change', function (e) {
+    if (pop.dataset.anchorKey !== '__cols__') return;
+    if (!e.target.matches('input[type=checkbox][data-col]')) return;
+    const key = e.target.dataset.col;
+    if (e.target.checked) visibleCols.add(key);
+    else visibleCols.delete(key);
+    saveVisibleCols(visibleCols);
+    applyVisibleCols(visibleCols);
+  });
+
+  popBody.addEventListener('click', function (e) {
+    if (e.target.id !== 'cols-reset') return;
+    visibleCols = new Set(COLS_DEFAULT_VISIBLE);
+    saveVisibleCols(visibleCols);
+    applyVisibleCols(visibleCols);
+    // Re-render the chooser to reflect the reset state.
+    popBody.innerHTML = renderColsChooser();
+  });
+
+  // --- Search modal -------------------------------------------------------
+  // The search widgets (query + domain checkboxes + advanced indexes) live
+  // in a modal opened by the 🔍 icon on the Question column header (and by
+  // clicking the body of the "Search:" pill in the active-filters row).
+  const searchModal = document.getElementById('search-modal');
+  const searchInput = document.getElementById('search-q');
+  const searchBtnEl = document.getElementById('search-btn');
+
+  function openSearchModal() {
+    // Prefill from FILTER_CURRENT (mirrors the URL we arrived with).
+    searchInput.value = FILTER_CURRENT.q || '';
+    const domains = new Set(FILTER_CURRENT.domains || []);
+    document.getElementById('search-d-question').checked = domains.size === 0 || domains.has('question');
+    document.getElementById('search-d-answer').checked   = domains.size === 0 || domains.has('answer');
+    const indexes = new Set(FILTER_CURRENT.indexes || []);
+    const lex = indexes.size === 0 || indexes.has('lex');
+    const sem = indexes.size === 0 || indexes.has('sem');
+    document.getElementById('search-i-lex').checked = lex;
+    document.getElementById('search-i-sem').checked = sem;
+    // Open Advanced section if the index selection is non-default.
+    document.getElementById('search-advanced').open = !(lex && sem);
+    searchModal.classList.add('open');
+    searchModal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
+    setTimeout(function () { searchInput.focus(); searchInput.select(); }, 30);
+  }
+
+  function closeSearchModal() {
+    searchModal.classList.remove('open');
+    searchModal.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+  }
+
+  function applySearch() {
+    const params = currentParams();
+    const q = searchInput.value.trim();
+    if (q) params.q = q; else delete params.q;
+    const domains = [];
+    if (document.getElementById('search-d-question').checked) domains.push('question');
+    if (document.getElementById('search-d-answer').checked) domains.push('answer');
+    // Only send d= if non-default (i.e. user unticked one).
+    if (domains.length && domains.length < 2) params.d = domains;
+    else delete params.d;
+    const indexes = [];
+    if (document.getElementById('search-i-lex').checked) indexes.push('lex');
+    if (document.getElementById('search-i-sem').checked) indexes.push('sem');
+    if (indexes.length && indexes.length < 2) params.i = indexes;
+    else delete params.i;
+    delete params.page;
+    navigate(params);
+  }
+
+  if (searchBtnEl) searchBtnEl.addEventListener('click', function (e) {
+    e.stopPropagation();
+    closePopover();
+    openSearchModal();
+  });
+  document.getElementById('search-apply').addEventListener('click', applySearch);
+  document.getElementById('search-clear').addEventListener('click', function () {
+    const params = currentParams();
+    delete params.q; delete params.d; delete params.i; delete params.page;
+    navigate(params);
+  });
+  searchModal.addEventListener('click', function (e) {
+    if (e.target === searchModal || e.target.hasAttribute('data-search-close')) closeSearchModal();
+  });
+  searchInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); applySearch(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && searchModal.classList.contains('open')) {
+      closeSearchModal();
+    }
+  });
+
+  // Clicking the *body* of the Search pill (not the ✕) re-opens the modal.
+  document.querySelectorAll('#active-filters .pill-search').forEach(function (p) {
+    p.addEventListener('click', function (e) {
+      if (e.target.closest('.pill-x')) return;
+      openSearchModal();
+    });
+  });
+
+  // --- Close handlers -----------------------------------------------------
+  // Close popover on outside click / Esc.
+  document.addEventListener('click', function (e) {
+    if (pop.hidden) return;
+    if (pop.contains(e.target)) return;
+    if (e.target.closest('.th-filter')) return;
+    if (e.target === colsBtn) return;
+    closePopover();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !pop.hidden) {
+      e.preventDefault();
+      closePopover();
+    }
+  });
+})();
+</script>
+{% endblock %}

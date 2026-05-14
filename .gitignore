@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# venv
+.venv/
+
+# Generated artefacts — rebuildable from the DB + ingest
+db/*.sqlite
+db/*.sqlite-*
+exports/
+questions/
+summary.md
+logs/
+hse_pdfs/
+
+# Probe / scratch scripts (any file beginning with underscore at repo root)
+/_*.py
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Temp files emitted by atomic-write
+*.tmp

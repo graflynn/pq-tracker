@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}PQ {{ row.pq_ref }} — {{ row.td_name }}{% endblock %}
+{% block headerstats %}
+  <a href="{{ url_for('list_view') }}">&larr; back to list</a>
+{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>PQ {{ row.pq_ref }}</h2>
+  <dl class="meta">
+    <dt>Date asked</dt><dd>{{ row.date_asked }}</dd>
+    <dt>Date answered</dt><dd>{{ row.date_answered or '— pending —' }}</dd>
+    <dt>TD</dt><dd>
+      {{ row.td_name }}
+      {% if row.td_party %}<span style="color:var(--muted);">&middot; {{ row.td_party }}</span>{% endif %}
+      {% if row.td_constituency %}<span style="color:var(--muted);">&middot; {{ row.td_constituency }}</span>{% endif %}
+    </dd>
+    <dt>Department</dt><dd>{{ row.department }}</dd>
+    {% if row.minister_name %}<dt>Minister</dt><dd>{{ row.minister_name }}</dd>{% endif %}
+    <dt>Status</dt><dd><span class="status-{{ row.answer_status }}">{{ row.answer_status }}</span></dd>
+    <dt>Matched topics</dt><dd>
+      {% for t in row.matched_topics_list %}<span class="chip">{{ t }}</span>{% endfor %}
+      {% if not row.matched_topics_list %}<span style="color:var(--muted);">—</span>{% endif %}
+    </dd>
+    <dt>Tags</dt><dd>
+      {% for t in row.tags %}<span class="chip chip-tag">{{ t }}</span>{% endfor %}
+      {% if not row.tags %}<span style="color:var(--muted);">—</span>{% endif %}
+    </dd>
+    <dt>Permalink</dt><dd><a href="{{ row.oireachtas_permalink }}" target="_blank" rel="noopener">{{ row.oireachtas_permalink }}</a></dd>
+    <dt>Source</dt><dd>{{ row.source }}</dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>Your notes</h2>
+  <form method="post" action="{{ url_for('save', pq_ref=row.pq_ref) }}">
+    <p>
+      <label for="constituent" style="display:block;color:var(--muted);font-size:12px;margin-bottom:3px;">
+        Constituent who prompted this PQ
+      </label>
+      <input id="constituent" name="constituent" type="text" value="{{ row.constituent or '' }}"
+             placeholder="e.g. Anne Doyle, Drogheda — diabetes review case">
+    </p>
+    <p>
+      <label for="tags" style="display:block;color:var(--muted);font-size:12px;margin-bottom:3px;">
+        Tags (comma-separated)
+      </label>
+      <input id="tags" name="tags" type="text"
+             value="{{ row.tags | join(', ') }}"
+             list="all-tags-list"
+             placeholder="e.g. follow-up, urgent, west-of-ireland">
+      <datalist id="all-tags-list">
+        {% for t in all_tags %}<option value="{{ t }}">{% endfor %}
+      </datalist>
+    </p>
+    <p>
+      <label for="notes" style="display:block;color:var(--muted);font-size:12px;margin-bottom:3px;">
+        Notes
+      </label>
+      <textarea id="notes" name="notes" rows="4"
+                placeholder="Free-form notes for your own use.">{{ row.notes or '' }}</textarea>
+    </p>
+    <p>
+      <label for="hse_pdf_url" style="display:block;color:var(--muted);font-size:12px;margin-bottom:3px;">
+        HSE PDF (manual attachment URL)
+      </label>
+      <input id="hse_pdf_url" name="hse_pdf_url" type="url" value="{{ row.hse_pdf_url or '' }}"
+             placeholder="https://...">
+    </p>
+    <button class="btn" type="submit">Save</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>HSE response PDFs</h2>
+  {% if row.hse_pdfs %}
+    {% for p in row.hse_pdfs %}
+      <div style="margin:6px 0;">
+        <span style="color:var(--muted);font-size:11px;">
+          {% if p.source == 'hse_live' %}live HSE site{% else %}Wayback archive{% endif %}
+          {% if p.publication_date %} &middot; {{ p.publication_date }}{% endif %}
+        </span><br>
+        <a href="{{ p.source_url }}" target="_blank" rel="noopener">{{ p.filename }}</a>
+        {% if p.local_path %}
+          &middot; <a href="{{ url_for('serve_hse_pdf', pdf_id=p.id) }}" target="_blank" rel="noopener">local copy</a>
+        {% else %}
+          &middot; <span style="color:var(--muted);">no local copy yet</span>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <div style="color:var(--muted);">No HSE PDF matched for this PQ ref.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Question</h2>
+  <div class="qa-body">{{ row.question_text }}</div>
+</div>
+
+<div class="card">
+  <h2>Answer</h2>
+  {% if row.answer_text %}
+    <div class="qa-body">{{ row.answer_text }}</div>
+  {% else %}
+    <div style="color:var(--muted);">Answer not yet published.</div>
+  {% endif %}
+</div>
+
+{% endblock %}

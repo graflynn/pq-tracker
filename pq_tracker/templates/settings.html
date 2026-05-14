@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}pq-tracker — settings{% endblock %}
+{% block headerstats %}
+  <a href="{{ url_for('list_view') }}">&larr; back to list</a>
+{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>Ingest filter &amp; auto-tags</h2>
+  <p style="color:var(--muted);font-size:13px;margin-top:0;">
+    Two lists, both saved to <code>topics.yaml</code>:
+  </p>
+  <ul style="color:var(--muted);font-size:13px;margin-top:4px;">
+    <li><b>Search terms</b> &mdash; gate at ingestion. A PQ is only stored if at
+      least one term appears in its text. Supports trailing-<code>*</code> wildcard
+      (<code>diabet*</code> matches <i>diabetes/diabetic/diabetics</i>). Removing or
+      narrowing this list does <em>not</em> retroactively delete rows; use the
+      <code>prune_corpus.py</code> script for that.</li>
+    <li><b>Auto-tag keywords</b> &mdash; tags applied to ingested PQs for grouping
+      and filtering. Removing a keyword drops the tag, not the row. After editing,
+      click <em>Rebuild auto-tags</em> to retroactively re-apply.</li>
+  </ul>
+
+  <form method="post" action="{{ url_for('settings_save_keywords') }}">
+
+    <h3 style="margin-top:18px;margin-bottom:8px;font-size:14px;">Search terms (ingest gate)</h3>
+    <div id="st-list">
+      {% for k in settings.search_terms %}
+      <div class="kw-row">
+        <input type="text" name="search_term" value="{{ k }}" placeholder="e.g. diabet*">
+        <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
+      </div>
+      {% endfor %}
+    </div>
+    <p style="margin-top:6px;">
+      <button type="button" class="btn secondary" id="st-add">+ Add search term</button>
+    </p>
+
+    <h3 style="margin-top:18px;margin-bottom:8px;font-size:14px;">Auto-tag keywords</h3>
+    <div id="kw-list">
+      {% for k in settings.keywords %}
+      <div class="kw-row">
+        <input type="text" name="keyword" value="{{ k }}" placeholder="keyword or phrase">
+        <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
+      </div>
+      {% endfor %}
+    </div>
+    <p style="margin-top:6px;">
+      <button type="button" class="btn secondary" id="kw-add">+ Add keyword</button>
+    </p>
+
+    <div class="meta" style="margin-top:18px;">
+      <dt>Lookback days</dt>
+      <dd>
+        <input type="number" name="lookback_days" value="{{ settings.lookback_days }}"
+               min="1" max="36500" style="width:120px;">
+        <span style="color:var(--muted);font-size:12px;margin-left:8px;">
+          Window the daily ingest re-scans, in days.
+        </span>
+      </dd>
+      <dt>Chambers</dt>
+      <dd>
+        <code>{{ ', '.join(settings.chambers) }}</code>
+        <span style="color:var(--muted);font-size:12px;margin-left:8px;">
+          (only Dáil tables written PQs; edit topics.yaml by hand to change)
+        </span>
+      </dd>
+    </div>
+
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button class="btn" type="submit">Save</button>
+      <button class="btn secondary" type="button" id="rebuild-btn"
+              title="Rescan every PQ in the database against the current keyword list.">
+        Rebuild auto-tags
+      </button>
+      <span id="rebuild-status" style="font-size:13px;color:var(--muted);"></span>
+      {% if saved == 'keywords' %}
+        <span style="color:var(--answered);font-size:13px;">Saved.</span>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>My tags</h2>
+  <p style="color:var(--muted);font-size:13px;margin-top:0;">
+    Tags you've created in the PQ modal. Rename to merge / fix typos across every PQ
+    that has the tag. Delete to remove it everywhere. New tags are created from the PQ
+    modal (Tags input).
+  </p>
+
+  {% if tag_counts %}
+  <table style="border:none;">
+    <thead><tr><th style="background:transparent;">Tag</th><th style="background:transparent;">PQs</th><th style="background:transparent;"></th></tr></thead>
+    <tbody id="tag-admin">
+      {% for tag, n in tag_counts %}
+      <tr data-tag="{{ tag }}">
+        <td><span class="chip chip-tag">{{ tag }}</span></td>
+        <td>{{ n }}</td>
+        <td style="text-align:right;">
+          <button class="btn secondary" type="button" data-action="rename">Rename</button>
+          <button class="btn secondary" type="button" data-action="delete"
+                  style="color:#b30000;border-color:#f3c2c2;">Delete</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p style="color:var(--muted);"><em>No manual tags yet. Add one from any PQ's modal.</em></p>
+  {% endif %}
+</div>
+
+<style>
+  .kw-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
+  .kw-row input { flex: 1; }
+  .kw-del { padding: 2px 10px; font-size: 16px; color: var(--muted); }
+</style>
+
+<script>
+(function () {
+  function wireList(listId, addBtnId, fieldName, placeholder) {
+    const list = document.getElementById(listId);
+    document.getElementById(addBtnId).addEventListener('click', function () {
+      const row = document.createElement('div');
+      row.className = 'kw-row';
+      row.innerHTML = '<input type="text" name="' + fieldName + '" placeholder="' + placeholder + '">'
+                    + '<button type="button" class="btn secondary kw-del" title="Remove">&times;</button>';
+      list.appendChild(row);
+      row.querySelector('input').focus();
+    });
+    list.addEventListener('click', function (e) {
+      if (e.target.classList.contains('kw-del')) e.target.parentElement.remove();
+    });
+  }
+  wireList('st-list', 'st-add', 'search_term', 'e.g. diabet*');
+  wireList('kw-list', 'kw-add', 'keyword',     'keyword or phrase');
+
+  // Tag admin
+  const tbody = document.getElementById('tag-admin');
+  if (tbody) {
+    tbody.addEventListener('click', function (e) {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const row = btn.closest('tr');
+      const tag = row.dataset.tag;
+      const action = btn.dataset.action;
+      if (action === 'rename') {
+        const next = prompt('Rename tag "' + tag + '" to:', tag);
+        if (!next || next.trim() === tag) return;
+        post({action: 'rename', tag: tag, new: next.trim()})
+          .then(function (data) {
+            if (data.ok) window.location.reload();
+            else alert('Rename failed: ' + (data.error || 'unknown'));
+          });
+      } else if (action === 'delete') {
+        if (!confirm('Delete tag "' + tag + '" from every PQ that has it?')) return;
+        post({action: 'delete', tag: tag})
+          .then(function (data) {
+            if (data.ok) row.remove();
+            else alert('Delete failed: ' + (data.error || 'unknown'));
+          });
+      }
+    });
+  }
+
+  function post(body) {
+    return fetch('/api/tag', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(function (r) { return r.json(); });
+  }
+
+  // Rebuild auto-tags: rescans every PQ against the current keyword list.
+  // Note: uses the keywords *as saved on disk*, so click "Save" first if you've
+  // edited the inputs but not committed them yet.
+  const rebuildBtn = document.getElementById('rebuild-btn');
+  const rebuildStatus = document.getElementById('rebuild-status');
+  if (rebuildBtn) {
+    rebuildBtn.addEventListener('click', function () {
+      if (!confirm('Rescan every PQ against the saved keyword list?\n\n'
+          + 'Make sure you clicked "Save" first if you just edited the keywords.')) return;
+      rebuildBtn.disabled = true;
+      rebuildStatus.textContent = 'Rebuilding…';
+      rebuildStatus.style.color = 'var(--muted)';
+      fetch('/api/topics/rebuild', {method: 'POST'})
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data.ok) throw new Error(data.error || 'unknown');
+          rebuildStatus.style.color = 'var(--answered)';
+          rebuildStatus.textContent = 'Done. Scanned ' + data.scanned
+            + ', updated ' + data.updated
+            + (data.cleared ? ' (' + data.cleared + ' cleared)' : '') + '.';
+        })
+        .catch(function (e) {
+          rebuildStatus.style.color = '#b30000';
+          rebuildStatus.textContent = 'Failed: ' + e.message;
+        })
+        .finally(function () { rebuildBtn.disabled = false; });
+    });
+  }
+})();
+</script>
+{% endblock %}
