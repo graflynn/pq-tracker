@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import config as cfg
 from . import db
+from . import embeddings as emb
 from . import exports
 from .matching import match_keywords
 from .oireachtas import (
@@ -99,6 +100,13 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
                  qa.xml_raw, qa.question_text or row["raw_question_showas"],
                  now, row["pq_ref"]),
             )
+            # Embed the answer that just landed (and re-embed the question if
+            # text changed). embed_pq skips sources whose chunk count matches.
+            try:
+                final_q = qa.question_text or row["raw_question_showas"]
+                emb.embed_pq(conn, row["pq_ref"], final_q, qa.answer_text)
+            except Exception as ee:  # noqa: BLE001
+                log.warning("embed failed for %s: %s", row["pq_ref"], ee)
             conn.commit()
             newly_answered += 1
             log.info("pending re-poll: %s → answered", row["pq_ref"])
@@ -220,6 +228,14 @@ def run(lookback_days: int | None = None, start_date: date | None = None,
                         new_count += 1
                     if result["newly_answered"] or (result["inserted"] and answer_status == "answered"):
                         answered_count += 1
+                    # Embed inline so freshly-ingested rows are searchable in
+                    # the same txn. embed_pq is idempotent — when chunk counts
+                    # match existing rows it's a no-op (no model load), so this
+                    # is free on the happy path of "row unchanged".
+                    try:
+                        emb.embed_pq(conn, entry.pq_ref, final_q, qa.answer_text)
+                    except Exception as ee:  # noqa: BLE001
+                        log.warning("embed failed for %s: %s", entry.pq_ref, ee)
                     # Commit per-match so the write lock isn't held across the next
                     # network roundtrip — keeps the UI responsive while a long backfill
                     # runs in parallel. WAL makes per-row commits cheap.

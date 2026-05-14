@@ -122,6 +122,62 @@ def insert_embeddings(conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
     )
 
 
+def existing_signature(conn: sqlite3.Connection) -> dict[tuple[str, str], int]:
+    """For each (pq_ref, source_type) currently embedded under the current model,
+    return chunk count. Batch fast-path for embed_pq(); pass to repeated calls so
+    each one avoids a COUNT round-trip."""
+    rows = conn.execute(
+        """SELECT source_pq_ref, source_type, COUNT(*) AS n
+             FROM embeddings WHERE model = ?
+            GROUP BY source_pq_ref, source_type""",
+        (MODEL_NAME,),
+    ).fetchall()
+    return {(r["source_pq_ref"], r["source_type"]): r["n"] for r in rows}
+
+
+def embed_pq(conn: sqlite3.Connection, pq_ref: str, question_text: str | None,
+             answer_text: str | None, *, existing: dict | None = None) -> tuple[int, int]:
+    """Embed question and (if present) answer for one PQ. Idempotent: when the
+    existing chunk count for a (pq_ref, source_type) matches the new chunk count
+    under the current model, that source is skipped — so the model is only
+    loaded when there's actual work to do, and re-running across an unchanged
+    corpus is a no-op.
+
+    Pass `existing` (from existing_signature()) when calling in a tight loop to
+    skip the per-row COUNT; otherwise it's looked up inline.
+
+    Returns (chunks_inserted, sources_embedded).
+    """
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    inserted = 0
+    sources = 0
+    for source_type, text in (("question", question_text), ("answer", answer_text)):
+        if not text or not text.strip():
+            continue
+        chunks = chunk_text(text)
+        if not chunks:
+            continue
+        if existing is not None:
+            already = existing.get((pq_ref, source_type), 0)
+        else:
+            already = conn.execute(
+                "SELECT COUNT(*) FROM embeddings "
+                "WHERE source_pq_ref = ? AND source_type = ? AND model = ?",
+                (pq_ref, source_type, MODEL_NAME),
+            ).fetchone()[0]
+        if already == len(chunks):
+            continue
+        delete_for_pq(conn, pq_ref, source_type=source_type)
+        vecs = embed_texts(chunks)
+        rows = [(source_type, pq_ref, None, i, chunk,
+                 MODEL_NAME, DIMS, pack(v), now)
+                for i, (chunk, v) in enumerate(zip(chunks, vecs))]
+        insert_embeddings(conn, rows)
+        inserted += len(rows)
+        sources += 1
+    return inserted, sources
+
+
 def load_matrix(conn: sqlite3.Connection, *, source_type: str) -> tuple[list[tuple], np.ndarray]:
     """Load every embedding of a given source_type into a single matrix.
 
