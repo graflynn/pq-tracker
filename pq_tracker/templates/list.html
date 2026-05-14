@@ -283,9 +283,7 @@
         <span class="searchbar-label">Search in:</span>
         <label class="cb"><input id="search-d-question" type="checkbox" value="question" checked> Question</label>
         <label class="cb"><input id="search-d-answer" type="checkbox" value="answer" checked> Answer</label>
-        <label class="cb cb-disabled" title="Coming in Phase 2 once HSE PDF text extraction is built.">
-          <input type="checkbox" disabled> HSE PDFs <span class="muted-tag">(Phase 2)</span>
-        </label>
+        <label class="cb"><input id="search-d-hse" type="checkbox" value="hse"> HSE PDFs</label>
       </div>
       <details class="searchbar-advanced" id="search-advanced">
         <summary>Advanced</summary>
@@ -410,13 +408,86 @@
         ? '<a href="/hse-pdf/' + p.id + '" target="_blank" rel="noopener">local copy</a>'
         : '<span style="color:var(--muted);">no local copy yet</span>';
       const pubDate = p.publication_date ? ' &middot; ' + escapeHtml(p.publication_date) : '';
-      return '<div style="margin:4px 0;">'
+      // Disclosure for extracted paragraph text. Open by default if a search
+      // is active that targets the HSE domain — the user is likely looking
+      // for matched paragraph context. Otherwise stays collapsed.
+      const hseSearchActive = !!(FILTER_CURRENT.q && (FILTER_CURRENT.domains || []).indexOf('hse') !== -1);
+      const openAttr = hseSearchActive ? ' open' : '';
+      const textBlock = p.local_path
+        ? ('<details class="hse-text-details" data-pdf-id="' + p.id + '"' + openAttr + ' style="margin-top:4px;">'
+            + '<summary style="cursor:pointer;color:var(--muted);font-size:12px;">Show extracted text</summary>'
+            + '<div class="hse-text-body" style="margin:6px 0 0 16px;font-size:12px;line-height:1.4;'
+            + 'max-height:340px;overflow:auto;border-left:2px solid var(--border, #ddd);padding-left:10px;">'
+            + '<span style="color:var(--muted);">Loading…</span></div>'
+          + '</details>')
+        : '';
+      return '<div style="margin:6px 0;">'
         + '<span style="color:var(--muted);font-size:11px;">' + sourceLabel + pubDate + '</span><br>'
         + '<a href="' + encodeURI(p.source_url) + '" target="_blank" rel="noopener">' + escapeHtml(p.filename) + '</a>'
         + ' &middot; ' + localLink
+        + textBlock
         + '</div>';
     });
     els.hsePdfs.innerHTML = rows.join('');
+    // Wire the lazy-load fetch for each disclosure. First open triggers a
+    // single network request; subsequent toggles reuse the rendered DOM.
+    Array.from(els.hsePdfs.querySelectorAll('.hse-text-details')).forEach(function (det) {
+      let loaded = false;
+      const body = det.querySelector('.hse-text-body');
+      function loadOnce() {
+        if (loaded) return;
+        loaded = true;
+        const pdfId = det.getAttribute('data-pdf-id');
+        let url = '/api/hse-pdf/' + encodeURIComponent(pdfId) + '/text';
+        if (FILTER_CURRENT.q) url += '?q=' + encodeURIComponent(FILTER_CURRENT.q);
+        fetch(url).then(function (r) { return r.json(); }).then(function (data) {
+          renderPdfText(body, data);
+        }).catch(function (e) {
+          body.innerHTML = '<span style="color:#a00;">Error: ' + escapeHtml(e.message) + '</span>';
+        });
+      }
+      det.addEventListener('toggle', function () { if (det.open) loadOnce(); });
+      if (det.open) loadOnce();
+    });
+  }
+
+  function renderPdfText(body, data) {
+    if (!data || !data.ok) {
+      body.innerHTML = '<span style="color:#a00;">Failed to load.</span>';
+      return;
+    }
+    if (data.status === 'empty') {
+      body.innerHTML = '<span style="color:var(--muted);">No extractable text — likely a scanned PDF.</span>';
+      return;
+    }
+    if (data.status === 'failed') {
+      body.innerHTML = '<span style="color:var(--muted);">Text extraction failed for this PDF.</span>';
+      return;
+    }
+    if (!data.paragraphs || !data.paragraphs.length) {
+      body.innerHTML = '<span style="color:var(--muted);">Not yet extracted.</span>';
+      return;
+    }
+    // OCR'd PDFs can have garbage tokens from logo/letterhead regions — warn so
+    // the user doesn't think the gibberish is the actual document content.
+    const ocrNotice = data.ocr_used
+      ? '<div style="color:var(--muted);font-size:11px;margin-bottom:6px;font-style:italic;">Text extracted via OCR — letterhead and signature regions may contain artifacts.</div>'
+      : '';
+    let lastPage = null;
+    const html = ocrNotice + data.paragraphs.map(function (para) {
+      let prefix = '';
+      if (para.page_no !== lastPage) {
+        prefix = '<div style="color:var(--muted);font-size:10px;margin:8px 0 2px;">— page ' + para.page_no + ' —</div>';
+        lastPage = para.page_no;
+      }
+      // Use highlighted HTML when search produced one, otherwise escape the
+      // plain paragraph text. FTS5 highlight() wraps tokens in trusted <mark>
+      // — its other output is the source text un-encoded, which we accept
+      // because the source is our own extracted plain text (no HTML).
+      const inner = para.html ? para.html : escapeHtml(para.text);
+      return prefix + '<p style="margin:4px 0;">' + inner + '</p>';
+    }).join('');
+    body.innerHTML = html;
   }
 
   function setMsg(text, isError) {
@@ -1134,8 +1205,11 @@ const FILTER_LABEL = {
     // Prefill from FILTER_CURRENT (mirrors the URL we arrived with).
     searchInput.value = FILTER_CURRENT.q || '';
     const domains = new Set(FILTER_CURRENT.domains || []);
-    document.getElementById('search-d-question').checked = domains.size === 0 || domains.has('question');
-    document.getElementById('search-d-answer').checked   = domains.size === 0 || domains.has('answer');
+    // No explicit selection ⇒ defaults (question + answer on, hse off).
+    const defaultDomains = domains.size === 0;
+    document.getElementById('search-d-question').checked = defaultDomains || domains.has('question');
+    document.getElementById('search-d-answer').checked   = defaultDomains || domains.has('answer');
+    document.getElementById('search-d-hse').checked      = !defaultDomains && domains.has('hse');
     const indexes = new Set(FILTER_CURRENT.indexes || []);
     const lex = indexes.size === 0 || indexes.has('lex');
     const sem = indexes.size === 0 || indexes.has('sem');
@@ -1162,8 +1236,10 @@ const FILTER_LABEL = {
     const domains = [];
     if (document.getElementById('search-d-question').checked) domains.push('question');
     if (document.getElementById('search-d-answer').checked) domains.push('answer');
-    // Only send d= if non-default (i.e. user unticked one).
-    if (domains.length && domains.length < 2) params.d = domains;
+    if (document.getElementById('search-d-hse').checked) domains.push('hse');
+    // Default is question+answer (no HSE). Only send d= when selection differs.
+    const isDefaultDomains = domains.length === 2 && domains[0] === 'question' && domains[1] === 'answer';
+    if (domains.length && !isDefaultDomains) params.d = domains;
     else delete params.d;
     const indexes = [];
     if (document.getElementById('search-i-lex').checked) indexes.push('lex');

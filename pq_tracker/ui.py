@@ -167,9 +167,6 @@ def _search_prefilter(conn, f: dict, limit: int = 500) -> tuple[list[str] | None
     lists are merged with Reciprocal Rank Fusion (k=60) into a single score
     map. Returns (ordered_pq_refs, score_map), or (None, {}) when no query
     is present so the caller falls back to default date ordering.
-
-    HSE is Phase 2 — the checkbox exists in the UI but is currently disabled,
-    so the domain shouldn't be set yet. We skip it defensively.
     """
     q = (f.get("q") or "").strip()
     domains = f.get("domains") or {"question", "answer"}
@@ -177,27 +174,34 @@ def _search_prefilter(conn, f: dict, limit: int = 500) -> tuple[list[str] | None
     if not q:
         return None, {}
 
-    # HSE search is Phase 2; ignore it silently for now.
     text_domains = [d for d in ("question", "answer") if d in domains]
-    if not text_domains:
+    want_hse = "hse" in domains
+    if not text_domains and not want_hse:
         return [], {}
 
     ranked_lists: list[list[dict]] = []
 
     # Lexical (BM25, porter-stemmed FTS5).
     if "lex" in indexes:
-        for domain in text_domains:
-            col = f"{domain}_text"
-            expr = _fts_escape(q)
-            if not expr:
-                continue
-            match_expr = f"{{{col}}}: {expr}"
-            try:
-                rows = _query_fts(conn, "questions_fts", match_expr, limit)
-            except sqlite3.OperationalError as e:
-                log_app(f"FTS failed for domain={domain}: {e}")
-                continue
-            ranked_lists.append([{"pq_ref": r["pq_ref"]} for r in rows])
+        expr = _fts_escape(q)
+        if expr:
+            for domain in text_domains:
+                col = f"{domain}_text"
+                match_expr = f"{{{col}}}: {expr}"
+                try:
+                    rows = _query_fts(conn, "questions_fts", match_expr, limit)
+                except sqlite3.OperationalError as e:
+                    log_app(f"FTS failed for domain={domain}: {e}")
+                    continue
+                ranked_lists.append([{"pq_ref": r["pq_ref"]} for r in rows])
+            if want_hse:
+                try:
+                    pq_refs = _query_hse_fts(conn, expr, limit)
+                except sqlite3.OperationalError as e:
+                    log_app(f"HSE FTS failed: {e}")
+                    pq_refs = []
+                if pq_refs:
+                    ranked_lists.append([{"pq_ref": r} for r in pq_refs])
 
     # Semantic (BGE embeddings, cosine).
     if "sem" in indexes:
@@ -213,13 +217,16 @@ def _search_prefilter(conn, f: dict, limit: int = 500) -> tuple[list[str] | None
                 if matrix.shape[0] == 0:
                     continue
                 order, scores = emb_mod.cosine_topk(qvec, matrix, k=limit)
-                # Collapse chunk-level hits to PQ-level, preserving best-rank order.
                 seen: dict[str, bool] = {}
                 for idx in order:
                     _, pq_ref, _, _, _ = meta[idx]
                     if pq_ref and pq_ref not in seen:
                         seen[pq_ref] = True
                 ranked_lists.append([{"pq_ref": r} for r in seen.keys()])
+            if want_hse:
+                pq_refs = _semantic_hse_pq_refs(conn, qvec, limit)
+                if pq_refs:
+                    ranked_lists.append([{"pq_ref": r} for r in pq_refs])
 
     if not ranked_lists:
         return [], {}
@@ -227,6 +234,87 @@ def _search_prefilter(conn, f: dict, limit: int = 500) -> tuple[list[str] | None
     score_map = _rrf_merge(*ranked_lists)
     ranked = sorted(score_map, key=lambda r: -score_map[r])
     return ranked, score_map
+
+
+def _pdf_pqrefs_map(conn, pdf_ids: list[int]) -> dict[int, list[str]]:
+    """Bulk-fetch pq_refs joined to each hse_pdf_id."""
+    if not pdf_ids:
+        return {}
+    placeholders = ",".join("?" * len(pdf_ids))
+    out: dict[int, list[str]] = {}
+    for r in conn.execute(
+        f"SELECT hse_pdf_id, pq_ref FROM hse_pdf_pqs WHERE hse_pdf_id IN ({placeholders})",
+        pdf_ids,
+    ):
+        out.setdefault(r[0], []).append(r[1])
+    return out
+
+
+def _query_hse_fts(conn, escaped_expr: str, limit: int) -> list[str]:
+    """BM25 over hse_paragraphs_fts → ranked pq_refs.
+
+    A paragraph hit can map to several PQs (grouped questions on one PDF);
+    each PQ surfaces at the best score it gets. Returns pq_refs ordered by
+    that best-rank, capped at `limit` overall.
+    """
+    rows = conn.execute(
+        """SELECT hp.hse_pdf_id, bm25(hse_paragraphs_fts) AS score
+             FROM hse_paragraphs_fts
+             JOIN hse_paragraphs hp ON hp.id = hse_paragraphs_fts.rowid
+            WHERE hse_paragraphs_fts MATCH ?
+            ORDER BY score
+            LIMIT ?""",
+        (escaped_expr, limit),
+    ).fetchall()
+    if not rows:
+        return []
+    pdf_ids_in_order: list[int] = []
+    seen_pdf: set[int] = set()
+    for r in rows:
+        pid = r["hse_pdf_id"]
+        if pid not in seen_pdf:
+            seen_pdf.add(pid)
+            pdf_ids_in_order.append(pid)
+    pdf_map = _pdf_pqrefs_map(conn, pdf_ids_in_order)
+    out: list[str] = []
+    seen_pq: set[str] = set()
+    for pid in pdf_ids_in_order:
+        for ref in pdf_map.get(pid, []):
+            if ref not in seen_pq:
+                seen_pq.add(ref)
+                out.append(ref)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _semantic_hse_pq_refs(conn, qvec, limit: int) -> list[str]:
+    """Cosine top-k over HSE paragraph embeddings → ranked pq_refs."""
+    from . import embeddings as emb_mod
+    meta, matrix = _emb_load(conn, "hse_paragraph")
+    if matrix.shape[0] == 0:
+        return []
+    # Pull more candidates than `limit` because many will share a PDF and
+    # collapse together — and because one PDF can fan back out to several PQs.
+    order, _ = emb_mod.cosine_topk(qvec, matrix, k=min(matrix.shape[0], limit * 4))
+    pdf_ids_in_order: list[int] = []
+    seen_pdf: set[int] = set()
+    for idx in order:
+        _, _, source_pdf_id, _, _ = meta[idx]
+        if source_pdf_id and source_pdf_id not in seen_pdf:
+            seen_pdf.add(source_pdf_id)
+            pdf_ids_in_order.append(source_pdf_id)
+    pdf_map = _pdf_pqrefs_map(conn, pdf_ids_in_order)
+    out: list[str] = []
+    seen_pq: set[str] = set()
+    for pid in pdf_ids_in_order:
+        for ref in pdf_map.get(pid, []):
+            if ref not in seen_pq:
+                seen_pq.add(ref)
+                out.append(ref)
+                if len(out) >= limit:
+                    return out
+    return out
 
 
 def log_app(msg: str) -> None:
@@ -961,6 +1049,74 @@ def api_search_semantic():
             "answer_status": r.get("answer_status"),
         })
     return jsonify({"ok": True, "results": out})
+
+
+@app.route("/api/hse-pdf/<int:pdf_id>/text", methods=["GET"])
+def api_hse_pdf_text(pdf_id: int):
+    """Return extracted paragraph text for one HSE PDF.
+
+    Optional ?q=... applies the same FTS5 escape as the main search and wraps
+    each lexical match with <mark>...</mark>. When the index has no match for
+    this PDF, paragraphs come back as plain text (the UI uses HTML escaping).
+
+    Response shape:
+      {
+        ok: true,
+        status: 'done'|'empty'|'failed'|'unprocessed',
+        page_count: int|null,
+        paragraphs: [{id, page_no, para_index, text, html?}, ...],
+      }
+    """
+    q = (request.args.get("q") or "").strip()
+    with _conn() as conn:
+        meta = conn.execute(
+            "SELECT id, text_extraction_status, text_page_count, ocr_used "
+            "  FROM hse_pdfs WHERE id = ?", (pdf_id,)
+        ).fetchone()
+        if meta is None:
+            abort(404)
+        status = meta["text_extraction_status"] or "unprocessed"
+        ocr_used = bool(meta["ocr_used"])
+        rows = conn.execute(
+            "SELECT id, page_no, para_index, text FROM hse_paragraphs "
+            "  WHERE hse_pdf_id = ? ORDER BY page_no, para_index",
+            (pdf_id,),
+        ).fetchall()
+        # Build paragraph_id → highlighted HTML when a search is active.
+        highlights: dict[int, str] = {}
+        if q and rows:
+            expr = _fts_escape(q)
+            if expr:
+                try:
+                    hl_rows = conn.execute(
+                        """SELECT hse_paragraphs_fts.rowid AS para_id,
+                                  highlight(hse_paragraphs_fts, 0, '<mark>', '</mark>') AS html
+                             FROM hse_paragraphs_fts
+                             JOIN hse_paragraphs hp ON hp.id = hse_paragraphs_fts.rowid
+                            WHERE hse_paragraphs_fts MATCH ?
+                              AND hp.hse_pdf_id = ?""",
+                        (expr, pdf_id),
+                    ).fetchall()
+                    for hl in hl_rows:
+                        if hl["html"] and "<mark>" in hl["html"]:
+                            highlights[hl["para_id"]] = hl["html"]
+                except sqlite3.OperationalError as e:
+                    log_app(f"HSE FTS highlight failed pdf_id={pdf_id}: {e}")
+    paragraphs = []
+    for r in rows:
+        item = {"id": r["id"], "page_no": r["page_no"],
+                "para_index": r["para_index"], "text": r["text"]}
+        if r["id"] in highlights:
+            item["html"] = highlights[r["id"]]
+        paragraphs.append(item)
+    return jsonify({
+        "ok": True,
+        "status": status,
+        "page_count": meta["text_page_count"],
+        "ocr_used": ocr_used,
+        "paragraphs": paragraphs,
+        "has_highlights": bool(highlights),
+    })
 
 
 @app.route("/hse-pdf/<int:pdf_id>")

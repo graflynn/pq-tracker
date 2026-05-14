@@ -18,6 +18,7 @@ from pathlib import Path
 from . import config as cfg
 from . import db
 from . import hse_scraper as scraper
+from . import hse_text
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,35 @@ def _save(conn, item: scraper.ScrapedPdf, local_path: Path | None,
     return pdf_id
 
 
+def _is_pq_linked(conn, pq_refs: list[str]) -> bool:
+    """True iff at least one of these refs is in the questions table."""
+    if not pq_refs:
+        return False
+    placeholders = ",".join("?" * len(pq_refs))
+    row = conn.execute(
+        f"SELECT 1 FROM questions WHERE pq_ref IN ({placeholders}) LIMIT 1", pq_refs
+    ).fetchone()
+    return row is not None
+
+
+def _extract_after_download(conn, pdf_id: int, pq_refs: list[str]) -> None:
+    """Best-effort: extract text + embed paragraphs after a successful download.
+
+    Restricted to PDFs that join a row in `questions` (matches the backfill
+    policy — Wayback in particular catalogs thousands of unmatched PDFs we
+    don't index). Failures are logged but don't fail the download.
+    """
+    if not _is_pq_linked(conn, pq_refs):
+        return
+    try:
+        result = hse_text.extract_and_index(conn, pdf_id, root=cfg.ROOT)
+        log.info("text-index pdf_id=%d status=%s paragraphs=%d emb=%d",
+                 pdf_id, result["status"], result["paragraphs"],
+                 result["embeddings_inserted"])
+    except Exception as e:
+        log.warning("text-index failed pdf_id=%d: %s", pdf_id, e)
+
+
 def _process_one(session, conn, item: scraper.ScrapedPdf, *, root: Path,
                  known_urls: set[str], delay_s: float, dry_run: bool) -> str:
     """Returns one of: 'skipped', 'downloaded', 'metadata_only', 'error'."""
@@ -71,10 +101,11 @@ def _process_one(session, conn, item: scraper.ScrapedPdf, *, root: Path,
         if target.exists() and target.stat().st_size > 0:
             # Already on disk but not in DB — record metadata, skip re-download.
             sha = bytes_size = None  # leave existing nulls; upsert will COALESCE
-            _save(conn, item, target, sha, bytes_size)
+            pdf_id = _save(conn, item, target, sha, bytes_size)
         else:
             sha, n = scraper.download_pdf(session, item.source_url, target, delay_s=delay_s)
-            _save(conn, item, target, sha, n)
+            pdf_id = _save(conn, item, target, sha, n)
+        _extract_after_download(conn, pdf_id, item.pq_refs)
         conn.commit()
         known_urls.add(item.source_url)
         return "downloaded"
@@ -179,7 +210,7 @@ def _wayback_download_pending(session, conn, *, matched_only: bool,
                 sha, bytes_size = scraper.download_pdf(
                     session, item.source_url, target, delay_s=delay_s
                 )
-            db.upsert_hse_pdf(
+            pdf_id, _ = db.upsert_hse_pdf(
                 conn,
                 source=item.source,
                 source_url=item.source_url,
@@ -192,6 +223,7 @@ def _wayback_download_pending(session, conn, *, matched_only: bool,
                 bytes_size=bytes_size,
                 fetched_at=datetime.utcnow().isoformat(timespec="seconds") if sha else None,
             )
+            _extract_after_download(conn, pdf_id, item.pq_refs)
             conn.commit()
             n_ok += 1
         except Exception as e:
@@ -337,6 +369,9 @@ def cmd_stats(args) -> int:
     for src, n in (s["by_source"] or {}).items():
         print(f"  {src}: {n}")
     print(f"PQ refs in your questions table with at least one matching HSE PDF: {s['matched_pq_refs']}")
+    print(f"Paragraph rows (extracted): {s['paragraphs']}")
+    for st, n in (s["by_extraction"] or {}).items():
+        print(f"  extraction[{st}]: {n}")
     return 0
 
 

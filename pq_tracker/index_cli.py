@@ -110,23 +110,85 @@ def cmd_reembed_all(args) -> int:
     return cmd_embed_questions(args)
 
 
+def cmd_extract_hse_text(args) -> int:
+    log_path = _configure_logging("index-hse-text")
+    from . import hse_text
+    matched_only = not args.all_pdfs
+    log.info("extracting HSE PDF text (matched_only=%s, redo=%s, redo_empty=%s, max=%s)",
+             matched_only, args.redo, args.redo_empty, args.max)
+    has_ocr = hse_text.tesseract_available()
+    log.info("Tesseract OCR fallback: %s", "enabled" if has_ocr else "disabled")
+    with db.connect(cfg.DB_PATH) as conn:
+        db.init_schema(conn)
+        para_sig = db.hse_paragraph_signature(conn)
+        pdf_ids = list(hse_text.iter_pending_pdf_ids(
+            conn, matched_only=matched_only, redo=args.redo,
+            redo_empty=args.redo_empty,
+        ))
+        total = len(pdf_ids)
+        log.info("queue: %d HSE PDFs to process", total)
+        n_done = n_empty = n_failed = n_skipped = n_ocr = 0
+        total_paragraphs = 0
+        for i, pdf_id in enumerate(pdf_ids, start=1):
+            if args.max is not None and (n_done + n_empty + n_failed) >= args.max:
+                log.info("hit --max cap, stopping at %d processed", args.max)
+                break
+            try:
+                result = hse_text.extract_and_index(
+                    conn, pdf_id, root=cfg.ROOT,
+                    existing_para_count=para_sig.get(pdf_id, 0),
+                    force=args.redo or args.redo_empty,
+                )
+            except Exception as e:
+                log.warning("unhandled error pdf_id=%d: %s", pdf_id, e)
+                n_failed += 1
+                continue
+            status = result["status"]
+            if result.get("ocr_used"):
+                n_ocr += 1
+            if status == "done":
+                if result["skipped"]:
+                    n_skipped += 1
+                else:
+                    n_done += 1
+                    total_paragraphs += result["paragraphs"]
+            elif status == "empty":
+                n_empty += 1
+            else:
+                n_failed += 1
+            if (i % 20) == 0:
+                conn.commit()
+                log.info("progress: %d/%d (done=%d empty=%d failed=%d skipped=%d ocr=%d paragraphs=%d)",
+                         i, total, n_done, n_empty, n_failed, n_skipped, n_ocr, total_paragraphs)
+        conn.commit()
+    log.info("complete: done=%d empty=%d failed=%d skipped=%d ocr=%d paragraphs=%d",
+             n_done, n_empty, n_failed, n_skipped, n_ocr, total_paragraphs)
+    log.info("log: %s", log_path)
+    print(f"done. log: {log_path}")
+    return 0
+
+
 def cmd_stats(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     with db.connect(cfg.DB_PATH) as conn:
         db.init_schema(conn)
         n_q = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
         n_fts = conn.execute("SELECT COUNT(*) FROM questions_fts").fetchone()[0]
+        n_paragraphs = conn.execute("SELECT COUNT(*) FROM hse_paragraphs").fetchone()[0]
+        n_para_fts = conn.execute("SELECT COUNT(*) FROM hse_paragraphs_fts").fetchone()[0]
         emb_breakdown = conn.execute(
             """SELECT source_type, COUNT(*) AS chunks,
-                      COUNT(DISTINCT source_pq_ref) AS distinct_pqs
+                      COUNT(DISTINCT COALESCE(source_pq_ref, CAST(source_pdf_id AS TEXT))) AS distinct_docs
                  FROM embeddings
                 GROUP BY source_type ORDER BY source_type"""
         ).fetchall()
-    print(f"questions:         {n_q}")
-    print(f"questions_fts:     {n_fts}")
+    print(f"questions:           {n_q}")
+    print(f"questions_fts:       {n_fts}")
+    print(f"hse_paragraphs:      {n_paragraphs}")
+    print(f"hse_paragraphs_fts:  {n_para_fts}")
     print("embeddings:")
     for r in emb_breakdown:
-        print(f"  {r['source_type']:15s}  chunks={r['chunks']:>6}  distinct_pqs={r['distinct_pqs']}")
+        print(f"  {r['source_type']:15s}  chunks={r['chunks']:>6}  distinct_docs={r['distinct_docs']}")
     return 0
 
 
@@ -140,6 +202,22 @@ def main(argv: list[str] | None = None) -> int:
         .set_defaults(func=cmd_embed_questions)
     sub.add_parser("reembed-all", help="Drop and rebuild all question/answer embeddings.")\
         .set_defaults(func=cmd_reembed_all)
+
+    px = sub.add_parser("extract-hse-text",
+                        help="Extract paragraph text from downloaded HSE PDFs and "
+                             "index them for BM25 + semantic search. Incremental.")
+    px.add_argument("--all-pdfs", action="store_true",
+                    help="Include PDFs that don't join a row in `questions` "
+                         "(default: only PQ-linked PDFs).")
+    px.add_argument("--redo", action="store_true",
+                    help="Re-extract every PDF, even ones already marked 'done'.")
+    px.add_argument("--redo-empty", action="store_true",
+                    help="Re-process PDFs marked 'empty' — useful after installing "
+                         "Tesseract to OCR previously-skipped image scans.")
+    px.add_argument("--max", type=int, default=None,
+                    help="Stop after this many PDFs processed (default: all).")
+    px.set_defaults(func=cmd_extract_hse_text)
+
     sub.add_parser("stats", help="Show index row counts.")\
         .set_defaults(func=cmd_stats)
 

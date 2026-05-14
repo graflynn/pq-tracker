@@ -11,4 +11,5 @@ dependencies = [
     "requests>=2.34.0",
     "fastembed>=0.4.0",
     "numpy>=2.0",
+    "pymupdf>=1.24",
 ]

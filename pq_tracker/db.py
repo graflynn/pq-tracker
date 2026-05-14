@@ -69,20 +69,26 @@ CREATE TABLE IF NOT EXISTS run_log (
 );
 
 CREATE TABLE IF NOT EXISTS hse_pdfs (
-  id                INTEGER PRIMARY KEY AUTOINCREMENT,
-  source            TEXT NOT NULL CHECK (source IN ('hse_live','hse_wayback')),
-  source_url        TEXT NOT NULL UNIQUE,
-  index_url         TEXT,
-  filename          TEXT NOT NULL,
-  local_path        TEXT,
-  pq_refs_json      TEXT NOT NULL DEFAULT '[]',
-  publication_date  DATE,
-  sha256            TEXT,
-  bytes             INTEGER,
-  fetched_at        TIMESTAMP,
-  first_seen_at     TIMESTAMP NOT NULL
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  source                   TEXT NOT NULL CHECK (source IN ('hse_live','hse_wayback')),
+  source_url               TEXT NOT NULL UNIQUE,
+  index_url                TEXT,
+  filename                 TEXT NOT NULL,
+  local_path               TEXT,
+  pq_refs_json             TEXT NOT NULL DEFAULT '[]',
+  publication_date         DATE,
+  sha256                   TEXT,
+  bytes                    INTEGER,
+  fetched_at               TIMESTAMP,
+  first_seen_at            TIMESTAMP NOT NULL,
+  text_extraction_status   TEXT,   -- NULL=not tried, 'done', 'empty', 'failed'
+  text_extracted_at        TIMESTAMP,
+  text_page_count          INTEGER,
+  ocr_used                 INTEGER NOT NULL DEFAULT 0   -- 0/1 — Tesseract OCR fallback was applied
 );
 CREATE INDEX IF NOT EXISTS ix_hse_pdfs_filename ON hse_pdfs(filename);
+-- ix_hse_pdfs_extract is created in init_schema() after the ALTER-ADD-COLUMN
+-- migration, since existing installs gain the column post-executescript().
 
 CREATE TABLE IF NOT EXISTS hse_pdf_pqs (
   hse_pdf_id INTEGER NOT NULL,
@@ -91,6 +97,30 @@ CREATE TABLE IF NOT EXISTS hse_pdf_pqs (
   FOREIGN KEY (hse_pdf_id) REFERENCES hse_pdfs(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS ix_hse_pdf_pqs_ref ON hse_pdf_pqs(pq_ref);
+
+-- One row per paragraph extracted from an HSE PDF. Source of truth for
+-- both lexical (hse_paragraphs_fts) and semantic (embeddings WHERE
+-- source_type='hse_paragraph', joined via source_pdf_id+chunk_index→para_index)
+-- search over PDF text. Rebuildable from local_path on disk.
+CREATE TABLE IF NOT EXISTS hse_paragraphs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  hse_pdf_id  INTEGER NOT NULL,
+  page_no     INTEGER NOT NULL,
+  para_index  INTEGER NOT NULL,
+  text        TEXT NOT NULL,
+  FOREIGN KEY (hse_pdf_id) REFERENCES hse_pdfs(id) ON DELETE CASCADE,
+  UNIQUE (hse_pdf_id, page_no, para_index)
+);
+CREATE INDEX IF NOT EXISTS ix_hse_paragraphs_pdf ON hse_paragraphs(hse_pdf_id);
+
+-- FTS5 mirror over hse_paragraphs.text. Same tokenizer settings as
+-- questions_fts so behaviour matches (stemmed, diacritic-folded, wildcards).
+CREATE VIRTUAL TABLE IF NOT EXISTS hse_paragraphs_fts USING fts5(
+  text,
+  content='hse_paragraphs',
+  content_rowid='id',
+  tokenize='porter unicode61 remove_diacritics 2'
+);
 
 -- FTS5 for BM25/lexical search over the questions table. Porter stemmer over
 -- a Unicode case-folding tokenizer: "diabetes" ↔ "diabetic", phrase queries
@@ -160,6 +190,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # Stores the raw Akoma Ntoso XML for each PQ so the modal can render
         # nicely-formatted HTML without round-tripping through plain text.
         conn.execute("ALTER TABLE questions ADD COLUMN xml_raw BLOB")
+    hse_cols = {row[1] for row in conn.execute("PRAGMA table_info(hse_pdfs)")}
+    if "text_extraction_status" not in hse_cols:
+        conn.execute("ALTER TABLE hse_pdfs ADD COLUMN text_extraction_status TEXT")
+    if "text_extracted_at" not in hse_cols:
+        conn.execute("ALTER TABLE hse_pdfs ADD COLUMN text_extracted_at TIMESTAMP")
+    if "text_page_count" not in hse_cols:
+        conn.execute("ALTER TABLE hse_pdfs ADD COLUMN text_page_count INTEGER")
+    if "ocr_used" not in hse_cols:
+        conn.execute("ALTER TABLE hse_pdfs ADD COLUMN ocr_used INTEGER NOT NULL DEFAULT 0")
+    # Now that the new columns exist on every install, the index is safe.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_hse_pdfs_extract "
+        "  ON hse_pdfs(text_extraction_status)"
+    )
     # One-shot data migration: strip the dead `/pq_` prefix from permalinks.
     # Cause: API gives e_id like "pq_1000" but the public site only accepts the
     # numeric tail (`.../question/2026-03-24/1000/`, not `.../pq_1000/`).
@@ -561,6 +605,84 @@ def get_hse_pdfs_for_pq(conn: sqlite3.Connection, pq_ref: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def replace_hse_paragraphs(conn: sqlite3.Connection, hse_pdf_id: int,
+                           paragraphs: list[tuple[int, int, str]]) -> list[int]:
+    """Replace the full paragraph set for one PDF. Returns inserted rowids in order.
+
+    `paragraphs` is [(page_no, para_index, text), ...]. The FTS5 mirror is
+    content-bound to hse_paragraphs and updated by triggers? No — content-bound
+    FTS5 in SQLite is a *contentless-ish* mode: we maintain it ourselves via
+    INSERT/DELETE statements that mirror the base table. We do that here.
+    """
+    # Drop existing paragraphs (cascades to embeddings via source_pdf_id FK on
+    # CASCADE — but the FK is on hse_pdfs(id), not hse_paragraphs(id), so we
+    # need to manually clear any HSE-paragraph embeddings for this PDF too).
+    old_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM hse_paragraphs WHERE hse_pdf_id = ?", (hse_pdf_id,)
+    )]
+    if old_ids:
+        conn.executemany(
+            "DELETE FROM hse_paragraphs_fts WHERE rowid = ?",
+            [(i,) for i in old_ids],
+        )
+        conn.execute("DELETE FROM hse_paragraphs WHERE hse_pdf_id = ?", (hse_pdf_id,))
+    # Also clear semantic embeddings for this PDF — they'll be regenerated.
+    conn.execute(
+        "DELETE FROM embeddings WHERE source_pdf_id = ? AND source_type = 'hse_paragraph'",
+        (hse_pdf_id,),
+    )
+    new_ids: list[int] = []
+    for page_no, para_idx, text in paragraphs:
+        cur = conn.execute(
+            "INSERT INTO hse_paragraphs(hse_pdf_id, page_no, para_index, text) "
+            "VALUES (?, ?, ?, ?)",
+            (hse_pdf_id, page_no, para_idx, text),
+        )
+        rowid = cur.lastrowid
+        new_ids.append(rowid)
+        conn.execute(
+            "INSERT INTO hse_paragraphs_fts(rowid, text) VALUES (?, ?)",
+            (rowid, text),
+        )
+    return new_ids
+
+
+def set_hse_extraction_status(conn: sqlite3.Connection, hse_pdf_id: int,
+                              status: str, page_count: int | None,
+                              ocr_used: bool = False) -> None:
+    """Record the outcome of an extraction attempt: 'done' | 'empty' | 'failed'."""
+    conn.execute(
+        """UPDATE hse_pdfs
+              SET text_extraction_status = ?,
+                  text_extracted_at = ?,
+                  text_page_count = ?,
+                  ocr_used = ?
+            WHERE id = ?""",
+        (status, datetime.utcnow().isoformat(timespec="seconds"),
+         page_count, 1 if ocr_used else 0, hse_pdf_id),
+    )
+
+
+def get_hse_paragraphs(conn: sqlite3.Connection, hse_pdf_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, page_no, para_index, text FROM hse_paragraphs "
+        "WHERE hse_pdf_id = ? ORDER BY page_no, para_index",
+        (hse_pdf_id,),
+    ).fetchall()
+
+
+def hse_paragraph_signature(conn: sqlite3.Connection) -> dict[int, int]:
+    """For each hse_pdf_id with paragraphs, return paragraph count.
+
+    Mirrors `embeddings.existing_signature()` shape: lets the indexer loop skip
+    PDFs whose paragraph count is unchanged.
+    """
+    rows = conn.execute(
+        "SELECT hse_pdf_id, COUNT(*) AS n FROM hse_paragraphs GROUP BY hse_pdf_id"
+    ).fetchall()
+    return {r["hse_pdf_id"]: r["n"] for r in rows}
+
+
 def hse_pdf_stats(conn: sqlite3.Connection) -> dict:
     total = conn.execute("SELECT COUNT(*) FROM hse_pdfs").fetchone()[0]
     by_src = dict(conn.execute(
@@ -571,7 +693,16 @@ def hse_pdf_stats(conn: sqlite3.Connection) -> dict:
              FROM hse_pdf_pqs j
              JOIN questions q ON q.pq_ref = j.pq_ref"""
     ).fetchone()[0]
-    return {"total": total, "by_source": by_src, "matched_pq_refs": matched}
+    by_extract = dict(conn.execute(
+        "SELECT COALESCE(text_extraction_status,'unprocessed') AS s, COUNT(*) "
+        "  FROM hse_pdfs GROUP BY s"
+    ).fetchall())
+    n_paragraphs = conn.execute("SELECT COUNT(*) FROM hse_paragraphs").fetchone()[0]
+    n_ocr = conn.execute(
+        "SELECT COUNT(*) FROM hse_pdfs WHERE ocr_used = 1"
+    ).fetchone()[0]
+    return {"total": total, "by_source": by_src, "matched_pq_refs": matched,
+            "by_extraction": by_extract, "paragraphs": n_paragraphs, "ocr": n_ocr}
 
 
 def distinct_values(conn: sqlite3.Connection, column: str) -> list[str]:
