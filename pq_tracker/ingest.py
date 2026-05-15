@@ -86,9 +86,11 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
             qa = client.fetch_xml(row["xml_url"], e_id)
             if qa is None or not qa.is_answered:
                 continue
+            answer_id = db.upsert_answer(conn, qa.answer_text)
             conn.execute(
                 """UPDATE questions
                       SET answer_text     = ?,
+                          answer_id       = ?,
                           answer_status   = 'answered',
                           date_answered   = COALESCE(date_answered, ?),
                           minister_name   = COALESCE(?, minister_name),
@@ -96,7 +98,7 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
                           question_text   = COALESCE(?, question_text),
                           last_updated_at = ?
                     WHERE pq_ref = ?""",
-                (qa.answer_text, today_iso, qa.minister_name,
+                (qa.answer_text, answer_id, today_iso, qa.minister_name,
                  qa.xml_raw, qa.question_text or row["raw_question_showas"],
                  now, row["pq_ref"]),
             )

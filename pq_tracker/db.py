@@ -317,6 +317,32 @@ def upsert_member(conn: sqlite3.Connection, member_code: str, full_name: str,
     )
 
 
+def upsert_answer(conn: sqlite3.Connection, answer_text: str | None) -> int | None:
+    """Return the canonical answers.id for this payload. Idempotent on content hash.
+
+    None/empty input → None (pending PQs have no answer to canonicalize).
+    """
+    if not answer_text or not answer_text.strip():
+        return None
+    h = _answer_content_hash(answer_text)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    existing = conn.execute(
+        "SELECT id FROM answers WHERE content_hash = ?", (h,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE answers SET last_seen_at = ? WHERE id = ?",
+            (now, existing["id"]),
+        )
+        return existing["id"]
+    cur = conn.execute(
+        "INSERT INTO answers(content_hash, answer_text, first_seen_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?)",
+        (h, answer_text, now, now),
+    )
+    return cur.lastrowid
+
+
 def upsert_question(conn: sqlite3.Connection, *,
                     pq_ref: str,
                     question_uri: str,
@@ -339,6 +365,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                     xml_raw: bytes | None = None) -> dict:
     """Returns {'inserted': bool, 'newly_answered': bool}."""
     now = datetime.utcnow().isoformat(timespec="seconds")
+    answer_id = upsert_answer(conn, answer_text)
     existing = conn.execute(
         "SELECT pq_ref, answer_status FROM questions WHERE pq_ref = ?", (pq_ref,)
     ).fetchone()
@@ -349,12 +376,12 @@ def upsert_question(conn: sqlite3.Connection, *,
               pq_ref, question_uri, date_asked, date_answered,
               td_name, td_member_code, td_party, td_constituency,
               department, minister_name,
-              question_text, answer_text, answer_status,
+              question_text, answer_text, answer_id, answer_status,
               matched_topics, oireachtas_permalink,
               xml_url, pdf_url, hse_pdf_url, constituent, notes,
               source, raw_question_showas, xml_raw,
               first_seen_at, last_updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
             """,
             (
                 pq_ref, question_uri,
@@ -362,7 +389,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_status,
+                question_text, answer_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink,
                 xml_url, pdf_url,
@@ -390,6 +417,7 @@ def upsert_question(conn: sqlite3.Connection, *,
               minister_name = ?,
               question_text = ?,
               answer_text = ?,
+              answer_id = ?,
               answer_status = ?,
               matched_topics = ?,
               oireachtas_permalink = ?,
@@ -406,7 +434,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_status,
+                question_text, answer_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas, xml_raw,
@@ -428,6 +456,7 @@ def upsert_question(conn: sqlite3.Connection, *,
               minister_name = ?,
               question_text = ?,
               answer_text = ?,
+              answer_id = ?,
               answer_status = ?,
               matched_topics = ?,
               oireachtas_permalink = ?,
@@ -443,7 +472,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_status,
+                question_text, answer_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas,
