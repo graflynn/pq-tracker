@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -39,6 +40,22 @@ CREATE INDEX IF NOT EXISTS ix_q_date_asked    ON questions(date_asked);
 CREATE INDEX IF NOT EXISTS ix_q_status        ON questions(answer_status);
 CREATE INDEX IF NOT EXISTS ix_q_member        ON questions(td_member_code);
 CREATE INDEX IF NOT EXISTS ix_q_department    ON questions(department);
+
+-- Canonical answer payloads. Many PQs share the same answer text because
+-- (a) the minister groups questions ("I propose to take Nos. X and Y together")
+-- and (b) HSE re-uses boilerplate answers across years and unrelated PQs.
+-- A `content_hash` over whitespace-normalized text deduplicates both cases.
+-- `questions.answer_id` is the canonical pointer; `questions.answer_text`
+-- is retained during the transition for FTS5/embeddings compatibility (will
+-- be dropped once those readers move to JOIN through this table).
+CREATE TABLE IF NOT EXISTS answers (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  content_hash    TEXT NOT NULL UNIQUE,
+  answer_text     TEXT NOT NULL,
+  first_seen_at   TIMESTAMP NOT NULL,
+  last_seen_at    TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_answers_hash ON answers(content_hash);
 
 CREATE TABLE IF NOT EXISTS members_cache (
   member_code         TEXT PRIMARY KEY,
@@ -178,6 +195,11 @@ def connect(db_path: Path):
         conn.close()
 
 
+def _answer_content_hash(answer_text: str) -> str:
+    """Normalize whitespace then sha256-hex. Used to dedupe answer payloads."""
+    return hashlib.sha256(" ".join(answer_text.split()).encode("utf-8")).hexdigest()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     # Lightweight migration for installs created before a column existed.
@@ -190,6 +212,47 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # Stores the raw Akoma Ntoso XML for each PQ so the modal can render
         # nicely-formatted HTML without round-tripping through plain text.
         conn.execute("ALTER TABLE questions ADD COLUMN xml_raw BLOB")
+    if "answer_id" not in cols:
+        # Canonical pointer into `answers`. Backfill below populates it for
+        # every answered row; ingest paths going forward set it inline.
+        conn.execute("ALTER TABLE questions ADD COLUMN answer_id INTEGER "
+                     "REFERENCES answers(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_q_answer_id "
+                     "  ON questions(answer_id)")
+    # Backfill answers/answer_id idempotently. Each run hashes every answered
+    # row missing an answer_id, upserts into `answers`, and points back.
+    # No-op once everything's wired (the WHERE eliminates touched rows).
+    pending = conn.execute(
+        """SELECT pq_ref, answer_text FROM questions
+            WHERE answer_status = 'answered'
+              AND answer_text IS NOT NULL
+              AND length(trim(answer_text)) > 0
+              AND answer_id IS NULL"""
+    ).fetchall()
+    if pending:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        for r in pending:
+            h = _answer_content_hash(r["answer_text"])
+            existing = conn.execute(
+                "SELECT id FROM answers WHERE content_hash = ?", (h,)
+            ).fetchone()
+            if existing:
+                ans_id = existing["id"]
+                conn.execute(
+                    "UPDATE answers SET last_seen_at = ? WHERE id = ?",
+                    (now, ans_id),
+                )
+            else:
+                cur = conn.execute(
+                    "INSERT INTO answers(content_hash, answer_text, "
+                    "  first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                    (h, r["answer_text"], now, now),
+                )
+                ans_id = cur.lastrowid
+            conn.execute(
+                "UPDATE questions SET answer_id = ? WHERE pq_ref = ?",
+                (ans_id, r["pq_ref"]),
+            )
     hse_cols = {row[1] for row in conn.execute("PRAGMA table_info(hse_pdfs)")}
     if "text_extraction_status" not in hse_cols:
         conn.execute("ALTER TABLE hse_pdfs ADD COLUMN text_extraction_status TEXT")
