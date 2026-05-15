@@ -230,6 +230,10 @@
       <section>
         <h3>Answer</h3>
         <div class="qa-body" id="m-answer"></div>
+        <div id="m-shared-wrap" class="shared-answer" style="display:none;">
+          <div id="m-shared-label"></div>
+          <div id="m-shared-list"></div>
+        </div>
       </section>
 
       <section>
@@ -395,6 +399,36 @@
     return String(s).replace(/[&<>"']/g, function (c) {
       return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
     });
+  }
+
+  function renderShared(siblings, total) {
+    // `siblings` excludes the current PQ; `total` includes it.
+    const wrap = document.getElementById('m-shared-wrap');
+    const list = document.getElementById('m-shared-list');
+    const label = document.getElementById('m-shared-label');
+    if (!siblings || siblings.length === 0) {
+      wrap.style.display = 'none';
+      return;
+    }
+    wrap.style.display = '';
+    const otherCount = (total || siblings.length + 1) - 1;
+    label.textContent = 'Also answered with ' + otherCount + ' other PQ' +
+                        (otherCount === 1 ? '' : 's') + ':';
+    const SHOW_N = 5;
+    const visible = siblings.slice(0, SHOW_N);
+    const chips = visible.map(function (s) {
+      const date = s.date_asked ? ' <span class="muted">(' + escapeHtml(s.date_asked) + ')</span>' : '';
+      const td = s.td_name ? ' <span class="muted">— ' + escapeHtml(s.td_name) + '</span>' : '';
+      return '<a href="#" class="shared-pq" data-pq="' + escapeHtml(s.pq_ref) +
+             '">PQ ' + escapeHtml(s.pq_ref) + '</a>' + date + td;
+    }).join('<br>');
+    let extra = '';
+    // Use the true total (not the API-cap of 50) so groups with hundreds of
+    // siblings advertise the real count.
+    if (otherCount > SHOW_N) {
+      extra = '<br><span class="muted">… and ' + (otherCount - SHOW_N) + ' more not shown</span>';
+    }
+    list.innerHTML = chips + extra;
   }
 
   function renderHsePdfs(pdfs) {
@@ -672,6 +706,7 @@
     } else {
       els.answer.textContent = row.answer_text || '(answer not yet published)';
     }
+    renderShared(row.shared_with || [], row.shared_total || 0);
     els.constituent.value = row.constituent || '';
     els.notes.value = row.notes || '';
     renderHsePdfs(row.hse_pdfs || []);
@@ -744,6 +779,14 @@
 
   // Close handlers: backdrop click, X button, Esc.
   modal.addEventListener('click', function (e) {
+    // Click on a sibling-PQ link inside the shared-answer block: open that one.
+    const sharedLink = e.target && e.target.closest && e.target.closest('a.shared-pq');
+    if (sharedLink) {
+      e.preventDefault();
+      const otherRef = sharedLink.getAttribute('data-pq');
+      if (otherRef) open(otherRef, null);
+      return;
+    }
     if (e.target === modal || e.target.hasAttribute('data-close')) close();
   });
   document.addEventListener('keydown', function (e) {

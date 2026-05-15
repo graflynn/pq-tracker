@@ -540,7 +540,7 @@ def api_get(pq_ref: str):
         row = db.get_question(conn, pq_ref)
         if row is None:
             abort(404)
-        d = _row_to_dict(row, conn)
+        d = _row_to_dict(row, conn, with_shared=True)
         if q and "lex" in indexes:
             match_expr = _fts_escape(q)
             if match_expr:
@@ -793,7 +793,8 @@ def api_save(pq_ref: str):
     return jsonify({"ok": False, "error": f"DB busy after retries: {last_err}"}), 503
 
 
-def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> dict:
+def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
+                 *, with_shared: bool = False) -> dict:
     d = dict(row)
     # xml_raw is BLOB — not JSON-serialisable and the client doesn't need it
     # in shared responses. Callers that DO need it (modal-render only) fetch
@@ -806,9 +807,20 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> di
     if conn is not None:
         d["tags"] = db.get_tags(conn, d["pq_ref"])
         d["hse_pdfs"] = db.get_hse_pdfs_for_pq(conn, d["pq_ref"])
+        if with_shared and d.get("answer_id"):
+            siblings, total = db.get_pqs_sharing_answer(
+                conn, d["answer_id"], exclude_ref=d["pq_ref"], limit=50,
+            )
+            d["shared_with"] = siblings
+            d["shared_total"] = total  # includes the current PQ itself
+        else:
+            d["shared_with"] = []
+            d["shared_total"] = 1 if d.get("answer_id") else 0
     else:
         d["tags"] = []
         d["hse_pdfs"] = []
+        d["shared_with"] = []
+        d["shared_total"] = 0
     return d
 
 

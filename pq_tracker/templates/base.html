@@ -207,6 +207,18 @@
   .saved { color: var(--answered); margin-left: 10px; font-size: 13px; }
   .truncate { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
               overflow: hidden; max-width: 60ch; }
+  .muted { color: var(--muted); font-size: 12px; }
+  /* "Also answered with ..." block in the modal — surfaces grouped/templated
+     answers via the shared answer_id. Subtle so it doesn't compete with the
+     answer body, but easy to scan. */
+  .shared-answer { margin-top: 14px; padding: 10px 12px;
+                   border-left: 3px solid var(--border); background: #fafbfd;
+                   border-radius: 0 4px 4px 0; font-size: 13px; }
+  .shared-answer #m-shared-label { color: var(--muted); font-size: 12px;
+                                   font-weight: 600; margin-bottom: 6px; }
+  .shared-answer a.shared-pq { font-family: ui-monospace, Menlo, monospace;
+                               text-decoration: none; }
+  .shared-answer a.shared-pq:hover { text-decoration: underline; }
 
   /* clickable rows */
   tr.clickable { cursor: pointer; }

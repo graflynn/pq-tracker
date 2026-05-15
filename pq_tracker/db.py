@@ -532,6 +532,30 @@ def get_question(conn: sqlite3.Connection, pq_ref: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM questions WHERE pq_ref = ?", (pq_ref,)).fetchone()
 
 
+def get_pqs_sharing_answer(conn: sqlite3.Connection, answer_id: int,
+                           exclude_ref: str | None = None,
+                           limit: int = 50) -> tuple[list[dict], int]:
+    """Return PQs that share this answer_id (excluding `exclude_ref` if given).
+
+    Returns (rows, total_count_including_excluded). Rows are ordered by
+    date_asked asc, pq_ref asc — first listed is the earliest, useful as
+    "the original question that produced this canned answer". Rows beyond
+    `limit` are not returned but counted in total.
+    """
+    total = conn.execute(
+        "SELECT COUNT(*) FROM questions WHERE answer_id = ?", (answer_id,)
+    ).fetchone()[0]
+    params: list = [answer_id]
+    sql = "SELECT pq_ref, date_asked, td_name FROM questions WHERE answer_id = ?"
+    if exclude_ref is not None:
+        sql += " AND pq_ref <> ?"
+        params.append(exclude_ref)
+    sql += " ORDER BY date_asked ASC, pq_ref ASC LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+    return rows, total
+
+
 def get_tags(conn: sqlite3.Connection, pq_ref: str) -> list[str]:
     rows = conn.execute(
         "SELECT tag FROM tags WHERE pq_ref = ? ORDER BY tag", (pq_ref,)
