@@ -403,6 +403,7 @@
 
   function renderShared(siblings, total) {
     // `siblings` excludes the current PQ; `total` includes it.
+    // Each sibling: {in_corpus, pq_ref|null, e_id, date_asked, td_name|null, oireachtas_url}
     const wrap = document.getElementById('m-shared-wrap');
     const list = document.getElementById('m-shared-list');
     const label = document.getElementById('m-shared-label');
@@ -412,23 +413,24 @@
     }
     wrap.style.display = '';
     const otherCount = (total || siblings.length + 1) - 1;
-    label.textContent = 'Also answered with ' + otherCount + ' other PQ' +
-                        (otherCount === 1 ? '' : 's') + ':';
-    const SHOW_N = 5;
-    const visible = siblings.slice(0, SHOW_N);
-    const chips = visible.map(function (s) {
+    label.textContent = 'Grouped with ' + otherCount + ' other PQ' +
+                        (otherCount === 1 ? '' : 's') +
+                        ' (minister took them together):';
+    const rows = siblings.map(function (s) {
       const date = s.date_asked ? ' <span class="muted">(' + escapeHtml(s.date_asked) + ')</span>' : '';
-      const td = s.td_name ? ' <span class="muted">— ' + escapeHtml(s.td_name) + '</span>' : '';
-      return '<a href="#" class="shared-pq" data-pq="' + escapeHtml(s.pq_ref) +
-             '">PQ ' + escapeHtml(s.pq_ref) + '</a>' + date + td;
-    }).join('<br>');
-    let extra = '';
-    // Use the true total (not the API-cap of 50) so groups with hundreds of
-    // siblings advertise the real count.
-    if (otherCount > SHOW_N) {
-      extra = '<br><span class="muted">… and ' + (otherCount - SHOW_N) + ' more not shown</span>';
-    }
-    list.innerHTML = chips + extra;
+      if (s.in_corpus) {
+        const td = s.td_name ? ' <span class="muted">— ' + escapeHtml(s.td_name) + '</span>' : '';
+        return '<a href="#" class="shared-pq" data-pq="' + escapeHtml(s.pq_ref) +
+               '">PQ ' + escapeHtml(s.pq_ref) + '</a>' + date + td;
+      }
+      // off-corpus — link out to Oireachtas, no in-app navigation
+      const url = escapeHtml(s.oireachtas_url || '#');
+      return '<a href="' + url + '" target="_blank" rel="noopener" class="shared-pq-ext">' +
+             'agenda #' + escapeHtml((s.e_id || '').replace(/^pq_/, '')) +
+             ' ↗</a>' + date +
+             ' <span class="muted">— not in corpus</span>';
+    });
+    list.innerHTML = rows.join('<br>');
   }
 
   function renderHsePdfs(pdfs) {

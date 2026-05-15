@@ -219,6 +219,12 @@
   .shared-answer a.shared-pq { font-family: ui-monospace, Menlo, monospace;
                                text-decoration: none; }
   .shared-answer a.shared-pq:hover { text-decoration: underline; }
+  /* Off-corpus siblings (the minister grouped a non-diabetes PQ we never
+     ingested). Link out to Oireachtas; visually distinct so the user can
+     tell at a glance that the click leaves the app. */
+  .shared-answer a.shared-pq-ext { font-family: ui-monospace, Menlo, monospace;
+                                   text-decoration: none; color: var(--muted); }
+  .shared-answer a.shared-pq-ext:hover { text-decoration: underline; color: inherit; }
 
   /* clickable rows */
   tr.clickable { cursor: pointer; }

@@ -807,15 +807,13 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
     if conn is not None:
         d["tags"] = db.get_tags(conn, d["pq_ref"])
         d["hse_pdfs"] = db.get_hse_pdfs_for_pq(conn, d["pq_ref"])
-        if with_shared and d.get("answer_id"):
-            siblings, total = db.get_pqs_sharing_answer(
-                conn, d["answer_id"], exclude_ref=d["pq_ref"], limit=50,
-            )
-            d["shared_with"] = siblings
-            d["shared_total"] = total  # includes the current PQ itself
+        if with_shared:
+            group = db.get_group_siblings(conn, d["pq_ref"])
+            d["shared_with"] = group["siblings"]
+            d["shared_total"] = group["total"]  # includes the current PQ
         else:
             d["shared_with"] = []
-            d["shared_total"] = 1 if d.get("answer_id") else 0
+            d["shared_total"] = 0
     else:
         d["tags"] = []
         d["hse_pdfs"] = []

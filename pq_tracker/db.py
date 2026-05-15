@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -532,28 +533,82 @@ def get_question(conn: sqlite3.Connection, pq_ref: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM questions WHERE pq_ref = ?", (pq_ref,)).fetchone()
 
 
-def get_pqs_sharing_answer(conn: sqlite3.Connection, answer_id: int,
-                           exclude_ref: str | None = None,
-                           limit: int = 50) -> tuple[list[dict], int]:
-    """Return PQs that share this answer_id (excluding `exclude_ref` if given).
+_Q_EID_RE = re.compile(r'<question\s+[^>]*?eId="([^"]+)"')
 
-    Returns (rows, total_count_including_excluded). Rows are ordered by
-    date_asked asc, pq_ref asc — first listed is the earliest, useful as
-    "the original question that produced this canned answer". Rows beyond
-    `limit` are not returned but counted in total.
+
+def get_group_siblings(conn: sqlite3.Connection, pq_ref: str) -> dict:
+    """Return the minister-grouped siblings for this PQ, derived from xml_raw.
+
+    The Oireachtas XML for a grouped PQ already contains one `<question>`
+    element per group member before the shared `<speech>`. We extract those
+    eIds, map each to (date_asked, eId) → pq_ref in our corpus, and return
+    a mixed list:
+
+      - in_corpus=True siblings have pq_ref + td_name (clickable in-app)
+      - in_corpus=False siblings have only e_id + oireachtas_url (out-link)
+
+    Off-corpus siblings exist when the minister grouped a question that
+    didn't pass our search_terms gate at ingest time. Surfacing them lets
+    you click through to Oireachtas without giving the false impression
+    that the group is smaller than it really is.
+
+    Returns: {"siblings": list[dict], "total": int}.
+    `total` includes this PQ itself; `siblings` excludes it.
+    A non-grouped PQ returns {"siblings": [], "total": 1}.
     """
-    total = conn.execute(
-        "SELECT COUNT(*) FROM questions WHERE answer_id = ?", (answer_id,)
-    ).fetchone()[0]
-    params: list = [answer_id]
-    sql = "SELECT pq_ref, date_asked, td_name FROM questions WHERE answer_id = ?"
-    if exclude_ref is not None:
-        sql += " AND pq_ref <> ?"
-        params.append(exclude_ref)
-    sql += " ORDER BY date_asked ASC, pq_ref ASC LIMIT ?"
-    params.append(limit)
-    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-    return rows, total
+    row = conn.execute(
+        "SELECT xml_raw, date_asked, question_uri FROM questions WHERE pq_ref = ?",
+        (pq_ref,),
+    ).fetchone()
+    if row is None or not row["xml_raw"]:
+        return {"siblings": [], "total": 1}
+    xml = row["xml_raw"]
+    if isinstance(xml, (bytes, bytearray)):
+        xml = bytes(xml).decode("utf-8", errors="replace")
+    eids = _Q_EID_RE.findall(xml)
+    if len(eids) <= 1:
+        return {"siblings": [], "total": 1}
+    my_eid = (row["question_uri"] or "").rsplit("/", 1)[-1]
+    if my_eid not in eids:
+        # Known Oireachtas API quirk: a handful of rows have an xml_raw whose
+        # <question> eIds don't include this row's own eId — i.e. the stored
+        # XML is the response to a different question. Without our own eId in
+        # the set we can't safely claim those other eIds as our siblings, so
+        # bail out as ungrouped. Memory notes this affects ~0.08% of rows.
+        return {"siblings": [], "total": 1}
+    date_asked = row["date_asked"]
+    out: list[dict] = []
+    for eid in eids:
+        if eid == my_eid:
+            continue
+        # Strip the "pq_" prefix to get the agenda number used in web URLs.
+        agenda_no = eid[3:] if eid.startswith("pq_") else eid
+        web_url = (f"https://www.oireachtas.ie/en/debates/question/"
+                   f"{date_asked}/{agenda_no}/")
+        sib = conn.execute(
+            "SELECT pq_ref, td_name FROM questions "
+            "WHERE date_asked = ? AND question_uri LIKE ?",
+            (date_asked, f"%/{eid}"),
+        ).fetchone()
+        if sib is not None:
+            out.append({
+                "in_corpus": True,
+                "pq_ref": sib["pq_ref"],
+                "e_id": eid,
+                "date_asked": date_asked,
+                "td_name": sib["td_name"],
+                "oireachtas_url": web_url,
+            })
+        else:
+            out.append({
+                "in_corpus": False,
+                "pq_ref": None,
+                "e_id": eid,
+                "date_asked": date_asked,
+                "td_name": None,
+                "oireachtas_url": web_url,
+            })
+    return {"siblings": out, "total": len(eids)}
 
 
 def get_tags(conn: sqlite3.Connection, pq_ref: str) -> list[str]:
