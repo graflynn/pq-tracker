@@ -24,10 +24,12 @@ from pathlib import Path
 from . import config as cfg
 from . import db
 from . import exports
+from .api import api as api_blueprint
 
 PAGE_SIZE = 50
 
 app = Flask(__name__, template_folder="templates")
+app.register_blueprint(api_blueprint)
 
 
 _PARTY_ABBREV = {
