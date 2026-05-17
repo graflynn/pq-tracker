@@ -1,0 +1,14 @@
+{
+  "name": "pq-tracker-local",
+  "owner": { "name": "Grainne" },
+  "description": "Personal local marketplace exposing the pq-tracker plugin to Cowork. Reads the plugin straight from ./pq-plugin so edits to skills/tools take effect on reload.",
+  "plugins": [
+    {
+      "name": "pq-tracker",
+      "source": "./pq-plugin",
+      "description": "Search and analyse the local pq-tracker corpus of Irish health-related parliamentary questions. Exposes the read-only /api/v1 endpoints as agent tools and ships a research skill for combining PQ data with other sources.",
+      "version": "0.1.0",
+      "author": { "name": "Grainne" }
+    }
+  ]
+}
