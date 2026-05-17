@@ -1,10 +1,15 @@
 # search_terms: ingestion gate. A PQ is only stored if at least one term
-#   appears in its text. Supports trailing-`*` wildcard (e.g. diabet* matches
-#   diabetes/diabetic/diabetics). Case- and hyphen-insensitive.
+#   appears in its text. Pure gate — does NOT create tags. Supports
+#   trailing-`*` wildcard (e.g. diabet* matches diabetes/diabetic/diabetics).
+#   Case- and hyphen-insensitive.
 # keywords: auto-tags applied to ingested PQs for display/filtering. Removing
-#   a keyword drops the tag, not the row. Use the Settings page button
-#   'Rebuild auto-tags' to retroactively re-apply after edits.
-# Both are maintained from /settings, but you can hand-edit too.
+#   a keyword drops the tag, not the row. Trailing-`*` wildcard supported.
+#   Alias syntax `match:label` matches one phrase but tags with a different
+#   label — e.g. `continuous glucose monitor*:cgm` matches the long phrase
+#   but tags the row 'cgm'. Multiple aliases for the same label collapse to
+#   one tag. Use Settings → 'Save & Rebuild auto-tags' to retroactively
+#   re-apply after edits.
+# Both lists are maintained from /settings, but you can hand-edit too.
 
 search_terms:
 - diabet*
@@ -20,6 +25,9 @@ keywords:
 - adults
 - education
 - resources
+- continuous glucose monitor*:cgm
+- gestational
+- pregnan*:gestational
 lookback_days: 1
 chambers:
 - dail

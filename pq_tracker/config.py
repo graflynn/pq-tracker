@@ -57,12 +57,17 @@ def ensure_dirs() -> None:
 
 _HEADER = (
     "# search_terms: ingestion gate. A PQ is only stored if at least one term\n"
-    "#   appears in its text. Supports trailing-`*` wildcard (e.g. diabet* matches\n"
-    "#   diabetes/diabetic/diabetics). Case- and hyphen-insensitive.\n"
+    "#   appears in its text. Pure gate — does NOT create tags. Supports\n"
+    "#   trailing-`*` wildcard (e.g. diabet* matches diabetes/diabetic/diabetics).\n"
+    "#   Case- and hyphen-insensitive.\n"
     "# keywords: auto-tags applied to ingested PQs for display/filtering. Removing\n"
-    "#   a keyword drops the tag, not the row. Use the Settings page button\n"
-    "#   'Rebuild auto-tags' to retroactively re-apply after edits.\n"
-    "# Both are maintained from /settings, but you can hand-edit too.\n"
+    "#   a keyword drops the tag, not the row. Trailing-`*` wildcard supported.\n"
+    "#   Alias syntax `match:label` matches one phrase but tags with a different\n"
+    "#   label — e.g. `continuous glucose monitor*:cgm` matches the long phrase\n"
+    "#   but tags the row 'cgm'. Multiple aliases for the same label collapse to\n"
+    "#   one tag. Use Settings → 'Save & Rebuild auto-tags' to retroactively\n"
+    "#   re-apply after edits.\n"
+    "# Both lists are maintained from /settings, but you can hand-edit too.\n"
     "\n"
 )
 

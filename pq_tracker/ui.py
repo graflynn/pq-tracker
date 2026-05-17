@@ -704,7 +704,13 @@ def settings_view():
 
 @app.route("/settings/keywords", methods=["POST"])
 def settings_save_keywords():
-    """Save topics.yaml from the form: search_terms[], keyword[], lookback_days."""
+    """Save topics.yaml from the form: search_terms[], keyword[], lookback_days.
+
+    Returns JSON when called via fetch (X-Requested-With: fetch) so the two
+    combined buttons ('Save & Refresh PQs', 'Save & Rebuild tags') can chain
+    a follow-up call without a full page reload. Otherwise redirects back
+    to /settings for the classic form-submit path.
+    """
 
     def _dedupe(raw: list[str]) -> list[str]:
         out: list[str] = []
@@ -738,7 +744,90 @@ def settings_save_keywords():
         chambers=current.chambers,
         xml_fetch_delay_ms=current.xml_fetch_delay_ms,
     ))
+    if request.headers.get("X-Requested-With") == "fetch":
+        return jsonify({
+            "ok": True,
+            "search_terms": search_terms,
+            "keywords": keywords,
+            "lookback_days": lookback,
+        })
     return redirect(url_for("settings_view", saved="keywords"))
+
+
+# In-process state for the background ingest. The Flask app is single-process,
+# so a module-level dict guarded by a lock is enough — no need for an external
+# queue. The scheduled daily ingest runs in a separate Python process and
+# competes for the SQLite write lock the normal way (WAL + busy_timeout).
+_ingest_state: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "lookback_days": None,
+    "result": None,        # dict from ingest.run() on success
+    "error": None,         # str on failure
+}
+_ingest_lock = threading.Lock()
+
+
+def _run_ingest_in_thread(lookback_days: int) -> None:
+    from . import ingest
+    from datetime import datetime as _dt
+    try:
+        result = ingest.run(lookback_days=lookback_days, log_to_file=True)
+        with _ingest_lock:
+            _ingest_state.update({
+                "running": False,
+                "finished_at": _dt.utcnow().isoformat(timespec="seconds"),
+                "result": result,
+            })
+    except Exception as e:  # noqa: BLE001
+        log_app(f"background ingest failed: {e}")
+        with _ingest_lock:
+            _ingest_state.update({
+                "running": False,
+                "finished_at": _dt.utcnow().isoformat(timespec="seconds"),
+                "error": str(e),
+            })
+
+
+@app.route("/api/ingest/start", methods=["POST"])
+def api_ingest_start():
+    """Kick off a fresh Oireachtas ingest in a background thread.
+
+    Uses ``lookback_days`` from the just-saved topics.yaml. Refuses if an
+    ingest is already in flight (409). The follow-up poll is
+    ``GET /api/ingest/status``.
+    """
+    from datetime import datetime as _dt
+    with _ingest_lock:
+        if _ingest_state["running"]:
+            return jsonify({
+                "ok": False,
+                "error": "ingest already running",
+                "started_at": _ingest_state["started_at"],
+            }), 409
+        lookback = cfg.load_config().lookback_days
+        _ingest_state.update({
+            "running": True,
+            "started_at": _dt.utcnow().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "lookback_days": lookback,
+            "result": None,
+            "error": None,
+        })
+    t = threading.Thread(
+        target=_run_ingest_in_thread, args=(lookback,), daemon=True,
+        name=f"ingest-lookback{lookback}",
+    )
+    t.start()
+    return jsonify({"ok": True, "started": True, "lookback_days": lookback})
+
+
+@app.route("/api/ingest/status", methods=["GET"])
+def api_ingest_status():
+    """Current state of the background ingest. Snapshot of the module dict."""
+    with _ingest_lock:
+        return jsonify(dict(_ingest_state))
 
 
 @app.route("/api/topics/rebuild", methods=["POST"])
@@ -750,7 +839,7 @@ def api_topics_rebuild():
     current keyword, so vestiges of removed keywords go away). Runs in a single
     transaction; expected to take a second or two even for the full 5k+ corpus.
     """
-    from .matching import match_keywords
+    from .matching import match_keyword_tags
     keywords = cfg.load_config().keywords
     scanned = 0
     updated = 0
@@ -762,7 +851,7 @@ def api_topics_rebuild():
         for r in rows:
             scanned += 1
             text = r["raw_question_showas"] or r["question_text"] or ""
-            hits = match_keywords(text, keywords)
+            hits = match_keyword_tags(text, keywords)
             try:
                 current = json.loads(r["matched_topics"] or "[]")
             except json.JSONDecodeError:

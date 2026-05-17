@@ -10,7 +10,7 @@ from . import config as cfg
 from . import db
 from . import embeddings as emb
 from . import exports
-from .matching import match_keywords
+from .matching import match_keyword_tags, match_search_terms
 from .oireachtas import (
     OireachtasClient,
     QuestionIndexEntry,
@@ -172,7 +172,7 @@ def run(lookback_days: int | None = None, start_date: date | None = None,
                 scanned += 1
                 # Gate (cheap, no XML fetch yet): does show_as mention any search term?
                 # If not, skip — we don't want to ingest this PQ at all.
-                if not match_keywords(entry.show_as, settings.search_terms):
+                if not match_search_terms(entry.show_as, settings.search_terms):
                     continue
                 matched += 1
                 if not entry.pq_ref:
@@ -204,7 +204,7 @@ def run(lookback_days: int | None = None, start_date: date | None = None,
                     # Auto-tags are independent from the gate: scan the final
                     # stored text against the keywords list. Same logic as
                     # api_topics_rebuild so retroactive rebuilds agree.
-                    tag_hits = match_keywords(
+                    tag_hits = match_keyword_tags(
                         f"{entry.show_as}\n{final_q}", settings.keywords
                     )
                     result = db.upsert_question(

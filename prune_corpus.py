@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from pq_tracker import config as cfg  # noqa: E402
 from pq_tracker import db  # noqa: E402
-from pq_tracker.matching import match_keywords  # noqa: E402
+from pq_tracker.matching import match_search_terms  # noqa: E402
 
 
 def main() -> int:
@@ -67,7 +67,7 @@ def main() -> int:
             text = "\n".join(filter(None, (
                 r["raw_question_showas"], r["question_text"], r["answer_text"]
             )))
-            if match_keywords(text, settings.search_terms):
+            if match_search_terms(text, settings.search_terms):
                 continue
             kill.append((r["pq_ref"], r["date_asked"]))
             if r["notes"] or r["constituent"] or r["hse_pdf_url"]:

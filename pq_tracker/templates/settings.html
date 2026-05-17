@@ -5,81 +5,78 @@
 {% endblock %}
 {% block content %}
 
+<form id="settings-form" method="post" action="{{ url_for('settings_save_keywords') }}">
+
 <div class="card">
-  <h2>Ingest filter &amp; auto-tags</h2>
+  <h2>Search terms <span style="font-weight:normal;color:var(--muted);font-size:14px;">— what we ingest from Oireachtas</span></h2>
   <p style="color:var(--muted);font-size:13px;margin-top:0;">
-    Two lists, both saved to <code>topics.yaml</code>:
+    A PQ is only stored if at least one term appears in its text. This list is a pure
+    gate — it does <em>not</em> create tags. Trailing-<code>*</code> wildcard
+    (<code>diabet*</code> matches <i>diabetes/diabetic/diabetics</i>) is supported.
+    Narrowing the list does <em>not</em> retroactively delete rows — use
+    <code>prune_corpus.py</code> for that.
   </p>
-  <ul style="color:var(--muted);font-size:13px;margin-top:4px;">
-    <li><b>Search terms</b> &mdash; gate at ingestion. A PQ is only stored if at
-      least one term appears in its text. Supports trailing-<code>*</code> wildcard
-      (<code>diabet*</code> matches <i>diabetes/diabetic/diabetics</i>). Removing or
-      narrowing this list does <em>not</em> retroactively delete rows; use the
-      <code>prune_corpus.py</code> script for that.</li>
-    <li><b>Auto-tag keywords</b> &mdash; tags applied to ingested PQs for grouping
-      and filtering. Removing a keyword drops the tag, not the row. After editing,
-      click <em>Rebuild auto-tags</em> to retroactively re-apply.</li>
-  </ul>
 
-  <form method="post" action="{{ url_for('settings_save_keywords') }}">
-
-    <h3 style="margin-top:18px;margin-bottom:8px;font-size:14px;">Search terms (ingest gate)</h3>
-    <div id="st-list">
-      {% for k in settings.search_terms %}
-      <div class="kw-row">
-        <input type="text" name="search_term" value="{{ k }}" placeholder="e.g. diabet*">
-        <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
-      </div>
-      {% endfor %}
+  <div id="st-list">
+    {% for k in settings.search_terms %}
+    <div class="kw-row">
+      <input type="text" name="search_term" value="{{ k }}" placeholder="e.g. diabet*">
+      <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
     </div>
-    <p style="margin-top:6px;">
-      <button type="button" class="btn secondary" id="st-add">+ Add search term</button>
-    </p>
+    {% endfor %}
+  </div>
+  <p style="margin-top:6px;">
+    <button type="button" class="btn secondary" id="st-add">+ Add search term</button>
+  </p>
 
-    <h3 style="margin-top:18px;margin-bottom:8px;font-size:14px;">Auto-tag keywords</h3>
-    <div id="kw-list">
-      {% for k in settings.keywords %}
-      <div class="kw-row">
-        <input type="text" name="keyword" value="{{ k }}" placeholder="keyword or phrase">
-        <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
-      </div>
-      {% endfor %}
-    </div>
-    <p style="margin-top:6px;">
-      <button type="button" class="btn secondary" id="kw-add">+ Add keyword</button>
-    </p>
+  <div class="kw-row" style="margin-top:14px;">
+    <label for="lookback-input" style="font-size:13px;">Lookback:</label>
+    <input id="lookback-input" type="number" name="lookback_days" value="{{ settings.lookback_days }}"
+           min="1" max="36500" style="width:90px;flex:0 0 auto;">
+    <span style="color:var(--muted);font-size:12px;">days — window the refresh re-scans (also used by the 10:00 daily run).</span>
+  </div>
 
-    <div class="meta" style="margin-top:18px;">
-      <dt>Lookback days</dt>
-      <dd>
-        <input type="number" name="lookback_days" value="{{ settings.lookback_days }}"
-               min="1" max="36500" style="width:120px;">
-        <span style="color:var(--muted);font-size:12px;margin-left:8px;">
-          Window the daily ingest re-scans, in days.
-        </span>
-      </dd>
-      <dt>Chambers</dt>
-      <dd>
-        <code>{{ ', '.join(settings.chambers) }}</code>
-        <span style="color:var(--muted);font-size:12px;margin-left:8px;">
-          (only Dáil tables written PQs; edit topics.yaml by hand to change)
-        </span>
-      </dd>
-    </div>
-
-    <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-      <button class="btn" type="submit">Save</button>
-      <button class="btn secondary" type="button" id="rebuild-btn"
-              title="Rescan every PQ in the database against the current keyword list.">
-        Rebuild auto-tags
-      </button>
-      <span id="rebuild-status" style="font-size:13px;color:var(--muted);"></span>
-      {% if saved == 'keywords' %}
-        <span style="color:var(--answered);font-size:13px;">Saved.</span>
-      {% endif %}
-    </div>
-  </form>
+  <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <button class="btn" type="button" id="save-refresh-btn"
+            title="Save topics.yaml, then run an Oireachtas ingest with the lookback above.">
+      Save &amp; Refresh PQs from Oireachtas
+    </button>
+    <span id="ingest-status" style="font-size:13px;color:var(--muted);"></span>
+  </div>
 </div>
+
+<div class="card">
+  <h2>Auto-tag keywords <span style="font-weight:normal;color:var(--muted);font-size:14px;">— how we label what we stored</span></h2>
+  <p style="color:var(--muted);font-size:13px;margin-top:0;">
+    Tags applied to every ingested PQ that matches. Removing a keyword drops the tag,
+    not the row. Trailing-<code>*</code> wildcard supported. Alias syntax
+    <code>match:label</code> matches the long phrase but tags with the short label
+    — e.g. <code>continuous glucose monitor*:cgm</code>. Multiple aliases pointing
+    at the same label collapse to one tag.
+  </p>
+
+  <div id="kw-list">
+    {% for k in settings.keywords %}
+    <div class="kw-row">
+      <input type="text" name="keyword" value="{{ k }}" placeholder="keyword or phrase  (or  long phrase:label)">
+      <button type="button" class="btn secondary kw-del" title="Remove">&times;</button>
+    </div>
+    {% endfor %}
+  </div>
+  <p style="margin-top:6px;">
+    <button type="button" class="btn secondary" id="kw-add">+ Add keyword</button>
+  </p>
+
+  <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <button class="btn" type="button" id="save-rebuild-btn"
+            title="Save topics.yaml, then re-tag every PQ in the corpus against the saved list.">
+      Save &amp; Rebuild auto-tags
+    </button>
+    <span id="rebuild-status" style="font-size:13px;color:var(--muted);"></span>
+  </div>
+</div>
+
+</form>
 
 <div class="card">
   <h2>My tags</h2>
@@ -113,7 +110,7 @@
 
 <style>
   .kw-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
-  .kw-row input { flex: 1; }
+  .kw-row input[type="text"] { flex: 1; }
   .kw-del { padding: 2px 10px; font-size: 16px; color: var(--muted); }
 </style>
 
@@ -134,7 +131,7 @@
     });
   }
   wireList('st-list', 'st-add', 'search_term', 'e.g. diabet*');
-  wireList('kw-list', 'kw-add', 'keyword',     'keyword or phrase');
+  wireList('kw-list', 'kw-add', 'keyword',     'keyword or phrase  (or  long phrase:label)');
 
   // Tag admin
   const tbody = document.getElementById('tag-admin');
@@ -172,34 +169,146 @@
     }).then(function (r) { return r.json(); });
   }
 
-  // Rebuild auto-tags: rescans every PQ against the current keyword list.
-  // Note: uses the keywords *as saved on disk*, so click "Save" first if you've
-  // edited the inputs but not committed them yet.
-  const rebuildBtn = document.getElementById('rebuild-btn');
-  const rebuildStatus = document.getElementById('rebuild-status');
-  if (rebuildBtn) {
-    rebuildBtn.addEventListener('click', function () {
-      if (!confirm('Rescan every PQ against the saved keyword list?\n\n'
-          + 'Make sure you clicked "Save" first if you just edited the keywords.')) return;
-      rebuildBtn.disabled = true;
-      rebuildStatus.textContent = 'Rebuilding…';
-      rebuildStatus.style.color = 'var(--muted)';
-      fetch('/api/topics/rebuild', {method: 'POST'})
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          if (!data.ok) throw new Error(data.error || 'unknown');
-          rebuildStatus.style.color = 'var(--answered)';
-          rebuildStatus.textContent = 'Done. Scanned ' + data.scanned
-            + ', updated ' + data.updated
-            + (data.cleared ? ' (' + data.cleared + ' cleared)' : '') + '.';
-        })
-        .catch(function (e) {
-          rebuildStatus.style.color = '#b30000';
-          rebuildStatus.textContent = 'Failed: ' + e.message;
-        })
-        .finally(function () { rebuildBtn.disabled = false; });
+  // Save the settings form via fetch (returns JSON). Both action buttons
+  // call this first, then chain into their action. Returns the parsed JSON
+  // on success or throws.
+  function saveForm() {
+    const form = document.getElementById('settings-form');
+    const data = new FormData(form);
+    return fetch(form.action, {
+      method: 'POST',
+      headers: {'X-Requested-With': 'fetch'},
+      body: data,
+    }).then(function (r) {
+      if (!r.ok) throw new Error('save failed: HTTP ' + r.status);
+      return r.json();
+    }).then(function (j) {
+      if (!j.ok) throw new Error(j.error || 'save returned not-ok');
+      return j;
     });
   }
+
+  // --- Save & Refresh PQs ---
+  const refreshBtn = document.getElementById('save-refresh-btn');
+  const ingestStatus = document.getElementById('ingest-status');
+  let ingestPoll = null;
+
+  function fmtElapsed(startedIso) {
+    if (!startedIso) return '';
+    const ms = Date.now() - new Date(startedIso + 'Z').getTime();
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return s + 's';
+    return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  }
+
+  function setStatus(el, text, kind) {
+    el.textContent = text;
+    el.style.color = kind === 'ok' ? 'var(--answered)'
+                    : kind === 'err' ? '#b30000'
+                    : 'var(--muted)';
+  }
+
+  function pollIngest() {
+    return fetch('/api/ingest/status').then(function (r) { return r.json(); })
+      .then(function (s) {
+        if (s.running) {
+          setStatus(ingestStatus,
+            'Running… (' + fmtElapsed(s.started_at) + ', lookback=' + s.lookback_days + 'd)',
+            null);
+          return false;
+        }
+        // finished
+        if (s.error) {
+          setStatus(ingestStatus, 'Failed: ' + s.error, 'err');
+        } else if (s.result) {
+          const r = s.result;
+          setStatus(ingestStatus,
+            'Done. new=' + r.new_questions + ' newly_answered=' + r.newly_answered
+            + ' errors=' + r.errors + '.',
+            r.errors ? 'err' : 'ok');
+        }
+        return true;
+      });
+  }
+
+  refreshBtn.addEventListener('click', function () {
+    if (ingestPoll) return;  // already polling
+    refreshBtn.disabled = true;
+    setStatus(ingestStatus, 'Saving…', null);
+    saveForm()
+      .then(function () {
+        setStatus(ingestStatus, 'Starting ingest…', null);
+        return fetch('/api/ingest/start', {method: 'POST'})
+          .then(function (r) {
+            if (r.status === 409) {
+              return r.json().then(function (j) {
+                throw new Error('Another ingest is already running (started ' + j.started_at + ')');
+              });
+            }
+            if (!r.ok) throw new Error('start failed: HTTP ' + r.status);
+            return r.json();
+          });
+      })
+      .then(function () {
+        ingestPoll = setInterval(function () {
+          pollIngest().then(function (done) {
+            if (done) {
+              clearInterval(ingestPoll);
+              ingestPoll = null;
+              refreshBtn.disabled = false;
+            }
+          });
+        }, 2000);
+        pollIngest();  // immediate first poll
+      })
+      .catch(function (e) {
+        setStatus(ingestStatus, e.message, 'err');
+        refreshBtn.disabled = false;
+      });
+  });
+
+  // If an ingest is already running from a prior page-load, attach the poller.
+  fetch('/api/ingest/status').then(function (r) { return r.json(); })
+    .then(function (s) {
+      if (s.running) {
+        refreshBtn.disabled = true;
+        ingestPoll = setInterval(function () {
+          pollIngest().then(function (done) {
+            if (done) {
+              clearInterval(ingestPoll);
+              ingestPoll = null;
+              refreshBtn.disabled = false;
+            }
+          });
+        }, 2000);
+        pollIngest();
+      }
+    });
+
+  // --- Save & Rebuild auto-tags ---
+  const rebuildBtn = document.getElementById('save-rebuild-btn');
+  const rebuildStatus = document.getElementById('rebuild-status');
+  rebuildBtn.addEventListener('click', function () {
+    rebuildBtn.disabled = true;
+    setStatus(rebuildStatus, 'Saving…', null);
+    saveForm()
+      .then(function () {
+        setStatus(rebuildStatus, 'Rebuilding…', null);
+        return fetch('/api/topics/rebuild', {method: 'POST'})
+          .then(function (r) { return r.json(); });
+      })
+      .then(function (data) {
+        if (!data.ok) throw new Error(data.error || 'unknown');
+        setStatus(rebuildStatus,
+          'Done. scanned=' + data.scanned + ' updated=' + data.updated
+          + (data.cleared ? ' (' + data.cleared + ' cleared)' : '') + '.',
+          'ok');
+      })
+      .catch(function (e) {
+        setStatus(rebuildStatus, 'Failed: ' + e.message, 'err');
+      })
+      .finally(function () { rebuildBtn.disabled = false; });
+  });
 })();
 </script>
 {% endblock %}
