@@ -39,11 +39,17 @@ XLSX_COLUMNS = [
 
 
 def write_xlsx(rows: list[sqlite3.Row], dest,
-               tags_map: dict[str, list[str]] | None = None) -> None:
+               tags_map: dict[str, list[str]] | None = None,
+               answers_map: dict[str, str] | None = None) -> None:
     """Write the xlsx to ``dest``, which can be a Path or a writable file-like
     object (e.g. an in-memory BytesIO for streaming as an HTTP download).
+
+    ``answers_map`` (pq_ref → answer_text) is required for the Answer column
+    since the text lives on `answers`, not `questions`. Pass
+    ``db.answers_by_pqref(conn)``.
     """
     tags_map = tags_map or {}
+    answers_map = answers_map or {}
     if isinstance(dest, Path):
         dest.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -59,6 +65,8 @@ def write_xlsx(rows: list[sqlite3.Row], dest,
         for c_idx, (key, _, _) in enumerate(XLSX_COLUMNS, start=1):
             if key == "tags_csv":
                 value = ", ".join(tags_map.get(row["pq_ref"], []))
+            elif key == "answer_text":
+                value = answers_map.get(row["pq_ref"])
             else:
                 value = row[key] if key in row.keys() else None
                 if key == "matched_topics" and value:
@@ -82,7 +90,8 @@ def _safe_pq_ref_for_filename(pq_ref: str) -> str:
 
 
 def write_question_markdown(row: sqlite3.Row, out_dir: Path,
-                            tags: list[str] | None = None) -> Path:
+                            tags: list[str] | None = None,
+                            answer_text: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     safe = _safe_pq_ref_for_filename(row["pq_ref"])
     date_asked = row["date_asked"] or ""
@@ -123,8 +132,8 @@ def write_question_markdown(row: sqlite3.Row, out_dir: Path,
     lines.append("")
     lines.append("## Answer")
     lines.append("")
-    if row["answer_text"]:
-        lines.append(row["answer_text"])
+    if answer_text:
+        lines.append(answer_text)
     else:
         lines.append("_Answer not yet published._")
     lines.append("")
@@ -187,11 +196,16 @@ def write_all(conn: sqlite3.Connection, run_started_iso: str,
     rows_in_run = db.all_matches_in_run(conn, run_started_iso)
     pending_total = sum(1 for r in all_rows if r["answer_status"] == "pending")
     tags_map = db.tags_by_pqref(conn)
+    answers_map = db.answers_by_pqref(conn)
 
     # The xlsx is now an on-demand export ("Export to Excel" in the UI), so the
     # ingest run no longer regenerates a stale full-corpus snapshot here.
     for row in all_rows:
-        write_question_markdown(row, cfg.QUESTIONS_DIR, tags=tags_map.get(row["pq_ref"]))
+        write_question_markdown(
+            row, cfg.QUESTIONS_DIR,
+            tags=tags_map.get(row["pq_ref"]),
+            answer_text=answers_map.get(row["pq_ref"]),
+        )
     write_summary(
         cfg.SUMMARY_PATH,
         run_started_iso=run_started_iso,

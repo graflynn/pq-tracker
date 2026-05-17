@@ -149,17 +149,17 @@ def _process_one(client: OireachtasClient, conn, mismatch: dict, *,
                   SET xml_url       = ?,
                       xml_raw       = ?,
                       question_text = ?,
-                      answer_text   = ?,
                       answer_id     = ?,
                       minister_name = COALESCE(?, minister_name),
                       answer_status = ?,
                       date_answered = ?,
                       last_updated_at = ?
                 WHERE pq_ref = ?""",
-            (cand_url, qa.xml_raw, qa.question_text, qa.answer_text, answer_id,
+            (cand_url, qa.xml_raw, qa.question_text, answer_id,
              qa.minister_name, new_status, date_answered,
              time.strftime("%Y-%m-%dT%H:%M:%S"), pq_ref),
         )
+        db.refresh_fts_for_pq(conn, pq_ref, qa.question_text, qa.answer_text)
         # Re-embed — embed_pq is idempotent on unchanged chunks.
         try:
             emb.embed_pq(conn, pq_ref, qa.question_text, qa.answer_text)

@@ -1,7 +1,8 @@
 """CLI for building and refreshing the search indexes.
 
 Two indexes live in the DB:
-  - questions_fts: SQLite FTS5 over questions.question_text + answer_text.
+  - questions_fts: SQLite FTS5 (inline content) over question_text +
+                   answer_text, where answer_text is JOIN'd from `answers`.
                    Maintained by an explicit rebuild call after bulk changes.
   - embeddings:    BGE-small vectors per (question, answer) of every PQ,
                    chunked for long answers.
@@ -50,14 +51,22 @@ def cmd_rebuild_fts(args) -> int:
     _configure_logging("index-fts")
     log.info("rebuilding FTS5 (porter) ...")
     with db.connect(cfg.DB_PATH) as conn:
-        # Drop and recreate so existing installs pick up tokenizer changes
-        # (FTS5 won't change options on an existing virtual table).
+        # Drop and recreate so existing installs pick up tokenizer or schema
+        # changes (FTS5 won't change options on an existing virtual table).
         conn.execute("DROP TABLE IF EXISTS questions_fts")
         # Also drop the now-defunct character-trigram table if a prior version
         # of this script created it.
         conn.execute("DROP TABLE IF EXISTS questions_trigram")
         db.init_schema(conn)
-        conn.execute("INSERT INTO questions_fts(questions_fts) VALUES('rebuild')")
+        # Inline-content FTS5: populate by JOINing answers via answer_id. Empty
+        # answer text is stored as '' so every question gets a searchable row.
+        conn.execute(
+            """INSERT INTO questions_fts(pq_ref, question_text, answer_text)
+               SELECT q.pq_ref, COALESCE(q.question_text, ''),
+                      COALESCE(a.answer_text, '')
+                 FROM questions q
+                 LEFT JOIN answers a ON a.id = q.answer_id"""
+        )
         conn.commit()
         n = conn.execute("SELECT COUNT(*) FROM questions_fts").fetchone()[0]
     log.info("done. questions_fts rows: %d", n)
@@ -75,7 +84,10 @@ def cmd_embed_questions(args) -> int:
         log.info("questions in DB: %d  rows already embedded: %d",
                  total, len({k[0] for k in existing}))
         rows = conn.execute(
-            "SELECT pq_ref, question_text, answer_text FROM questions ORDER BY pq_ref"
+            """SELECT q.pq_ref, q.question_text, a.answer_text
+                 FROM questions q
+                 LEFT JOIN answers a ON a.id = q.answer_id
+                ORDER BY q.pq_ref"""
         ).fetchall()
         n_pq = n_chunks = 0
         for i, r in enumerate(rows):

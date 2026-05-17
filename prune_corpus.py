@@ -51,11 +51,13 @@ def main() -> int:
     with db.connect(cfg.DB_PATH) as conn:
         db.init_schema(conn)
         rows = conn.execute(
-            """SELECT pq_ref, date_asked, raw_question_showas, question_text, answer_text,
-                      COALESCE(notes,'') AS notes,
-                      COALESCE(constituent,'') AS constituent,
-                      COALESCE(hse_pdf_url,'') AS hse_pdf_url
-                 FROM questions"""
+            """SELECT q.pq_ref, q.date_asked, q.raw_question_showas,
+                      q.question_text, a.answer_text,
+                      COALESCE(q.notes,'') AS notes,
+                      COALESCE(q.constituent,'') AS constituent,
+                      COALESCE(q.hse_pdf_url,'') AS hse_pdf_url
+                 FROM questions q
+                 LEFT JOIN answers a ON a.id = q.answer_id"""
         ).fetchall()
         total = len(rows)
 
@@ -121,10 +123,15 @@ def main() -> int:
             )
         conn.commit()
 
-        # FTS5 with content='questions' tracks the source table only when rows
-        # are deleted via the same connection inside an active txn — safer to
-        # rebuild after a bulk prune than to assume incremental triggers fired.
-        conn.execute("INSERT INTO questions_fts(questions_fts) VALUES('rebuild')")
+        # FTS5 is now inline-content and we maintain it manually via
+        # refresh_fts_for_pq on writes. After bulk DELETEs we need to purge
+        # the FTS rows for the pruned pq_refs to keep search consistent.
+        for i in range(0, len(refs), BATCH):
+            chunk = refs[i:i + BATCH]
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(
+                f"DELETE FROM questions_fts WHERE pq_ref IN ({placeholders})", chunk
+            )
         conn.commit()
 
         remaining = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]

@@ -121,20 +121,22 @@ def main() -> int:
                         pq_ref, e_id, xml_url)
 
         now = datetime.utcnow().isoformat(timespec="seconds")
+        answer_id = db.upsert_answer(conn, qa.answer_text)
         conn.execute(
             """UPDATE questions
                   SET xml_raw = ?,
                       question_text = ?,
-                      answer_text = ?,
+                      answer_id = COALESCE(?, answer_id),
                       minister_name = COALESCE(?, minister_name),
                       last_updated_at = ?
                 WHERE pq_ref = ?""",
             (xml_bytes,
              question_text,
-             qa.answer_text,
+             answer_id,
              qa.minister_name,
              now, pq_ref),
         )
+        db.refresh_fts_for_pq(conn, pq_ref, question_text, qa.answer_text)
         updated += 1
         processed += 1
         if updated % 50 == 0:

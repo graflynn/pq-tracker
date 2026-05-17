@@ -607,9 +607,8 @@ def api_get(pq_ref: str):
                     """SELECT highlight(questions_fts, 0, '<mark>', '</mark>') AS hq,
                               highlight(questions_fts, 1, '<mark>', '</mark>') AS ha
                          FROM questions_fts
-                         JOIN questions ON questions.rowid = questions_fts.rowid
                         WHERE questions_fts MATCH ?
-                          AND questions.pq_ref = ?""",
+                          AND questions_fts.pq_ref = ?""",
                     (match_expr, pq_ref),
                 ).fetchone()
                 if hl is not None:
@@ -668,8 +667,9 @@ def export_xlsx():
                 params,
             ).fetchall()
         tags_map = db.tags_by_pqref(conn)
+        answers_map = db.answers_by_pqref(conn)
     buf = io.BytesIO()
-    exports.write_xlsx(rows, buf, tags_map=tags_map)
+    exports.write_xlsx(rows, buf, tags_map=tags_map, answers_map=answers_map)
     buf.seek(0)
     filtered = any(v for k, v in f.items())
     suffix = "filtered" if filtered else "all"
@@ -919,6 +919,16 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
     # in shared responses. Callers that DO need it (modal-render only) fetch
     # the bytes via a dedicated query.
     d.pop("xml_raw", None)
+    # answer_text lives on `answers`, joined via answer_id. Inject here so
+    # downstream callers (JSON modal, detail.html, markdown export) keep
+    # seeing `d["answer_text"]` without each one repeating the JOIN.
+    if conn is not None and d.get("answer_id"):
+        ans = conn.execute(
+            "SELECT answer_text FROM answers WHERE id = ?", (d["answer_id"],)
+        ).fetchone()
+        d["answer_text"] = ans["answer_text"] if ans else None
+    else:
+        d["answer_text"] = None
     try:
         d["matched_topics_list"] = json.loads(d.get("matched_topics") or "[]")
     except json.JSONDecodeError:
@@ -1036,7 +1046,7 @@ def _query_fts(conn, table: str, match_expr: str, limit: int) -> list:
                    snippet({table}, 0, '<mark>', '</mark>', '...', 12) AS snippet_q,
                    snippet({table}, 1, '<mark>', '</mark>', '...', 12) AS snippet_a
               FROM {table}
-              JOIN questions q ON q.rowid = {table}.rowid
+              JOIN questions q ON q.pq_ref = {table}.pq_ref
              WHERE {table} MATCH ?
              ORDER BY score
              LIMIT ?""",

@@ -87,10 +87,10 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
             if qa is None or not qa.is_answered:
                 continue
             answer_id = db.upsert_answer(conn, qa.answer_text)
+            final_q = qa.question_text or row["raw_question_showas"]
             conn.execute(
                 """UPDATE questions
-                      SET answer_text     = ?,
-                          answer_id       = ?,
+                      SET answer_id       = ?,
                           answer_status   = 'answered',
                           date_answered   = COALESCE(date_answered, ?),
                           minister_name   = COALESCE(?, minister_name),
@@ -98,14 +98,15 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
                           question_text   = COALESCE(?, question_text),
                           last_updated_at = ?
                     WHERE pq_ref = ?""",
-                (qa.answer_text, answer_id, today_iso, qa.minister_name,
-                 qa.xml_raw, qa.question_text or row["raw_question_showas"],
+                (answer_id, today_iso, qa.minister_name,
+                 qa.xml_raw, final_q,
                  now, row["pq_ref"]),
             )
+            # Mirror into FTS5 (inline-content: no auto-sync from the base table).
+            db.refresh_fts_for_pq(conn, row["pq_ref"], final_q, qa.answer_text)
             # Embed the answer that just landed (and re-embed the question if
             # text changed). embed_pq skips sources whose chunk count matches.
             try:
-                final_q = qa.question_text or row["raw_question_showas"]
                 emb.embed_pq(conn, row["pq_ref"], final_q, qa.answer_text)
             except Exception as ee:  # noqa: BLE001
                 log.warning("embed failed for %s: %s", row["pq_ref"], ee)

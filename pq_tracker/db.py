@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS questions (
   department           TEXT NOT NULL,
   minister_name        TEXT,
   question_text        TEXT NOT NULL,
-  answer_text          TEXT,
   answer_status        TEXT NOT NULL CHECK (answer_status IN ('pending','answered')),
   matched_topics       TEXT NOT NULL,
   oireachtas_permalink TEXT NOT NULL,
@@ -46,9 +45,8 @@ CREATE INDEX IF NOT EXISTS ix_q_department    ON questions(department);
 -- (a) the minister groups questions ("I propose to take Nos. X and Y together")
 -- and (b) HSE re-uses boilerplate answers across years and unrelated PQs.
 -- A `content_hash` over whitespace-normalized text deduplicates both cases.
--- `questions.answer_id` is the canonical pointer; `questions.answer_text`
--- is retained during the transition for FTS5/embeddings compatibility (will
--- be dropped once those readers move to JOIN through this table).
+-- `questions.answer_id` is the sole pointer to the payload; readers JOIN
+-- through this table for the text.
 CREATE TABLE IF NOT EXISTS answers (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   content_hash    TEXT NOT NULL UNIQUE,
@@ -143,12 +141,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS hse_paragraphs_fts USING fts5(
 -- FTS5 for BM25/lexical search over the questions table. Porter stemmer over
 -- a Unicode case-folding tokenizer: "diabetes" ↔ "diabetic", phrase queries
 -- "home help hours" match stems regardless of conjugation, wildcards via diab*.
--- Uses the `questions` table as its content store — no duplication of text.
--- Rebuild after bulk ingest: INSERT INTO questions_fts(questions_fts) VALUES('rebuild')
+-- Inline-content (FTS owns its own copy): answer_text used to live on
+-- `questions` directly; it now lives on `answers` and is joined in at write
+-- time via `refresh_fts_for_pq`. Inline content (vs `content='questions'`) is
+-- required because we use highlight() and snippet() in the modal/search paths,
+-- which contentless FTS5 doesn't support. `pq_ref` is UNINDEXED so callers can
+-- JOIN back to `questions` without a rowid coupling — keeps the index stable
+-- across deletes/inserts. Rebuild after bulk text changes via
+-- `python -m pq_tracker.index_cli rebuild-fts`.
 CREATE VIRTUAL TABLE IF NOT EXISTS questions_fts USING fts5(
   question_text, answer_text,
-  content='questions',
-  content_rowid='rowid',
+  pq_ref UNINDEXED,
   tokenize='porter unicode61 remove_diacritics 2'
 );
 
@@ -227,40 +230,42 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE questions ADD COLUMN question_group_key TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_q_group_key "
                      "  ON questions(question_group_key)")
-    # Backfill answers/answer_id idempotently. Each run hashes every answered
+    # Backfill answers/answer_id from legacy `answer_text` column when it
+    # still exists (pre-2026-05-17 schema). Each run hashes every answered
     # row missing an answer_id, upserts into `answers`, and points back.
-    # No-op once everything's wired (the WHERE eliminates touched rows).
-    pending = conn.execute(
-        """SELECT pq_ref, answer_text FROM questions
-            WHERE answer_status = 'answered'
-              AND answer_text IS NOT NULL
-              AND length(trim(answer_text)) > 0
-              AND answer_id IS NULL"""
-    ).fetchall()
-    if pending:
-        now = datetime.utcnow().isoformat(timespec="seconds")
-        for r in pending:
-            h = _answer_content_hash(r["answer_text"])
-            existing = conn.execute(
-                "SELECT id FROM answers WHERE content_hash = ?", (h,)
-            ).fetchone()
-            if existing:
-                ans_id = existing["id"]
+    # Skipped wholesale on post-DROP-COLUMN installs.
+    if "answer_text" in cols:
+        pending = conn.execute(
+            """SELECT pq_ref, answer_text FROM questions
+                WHERE answer_status = 'answered'
+                  AND answer_text IS NOT NULL
+                  AND length(trim(answer_text)) > 0
+                  AND answer_id IS NULL"""
+        ).fetchall()
+        if pending:
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            for r in pending:
+                h = _answer_content_hash(r["answer_text"])
+                existing = conn.execute(
+                    "SELECT id FROM answers WHERE content_hash = ?", (h,)
+                ).fetchone()
+                if existing:
+                    ans_id = existing["id"]
+                    conn.execute(
+                        "UPDATE answers SET last_seen_at = ? WHERE id = ?",
+                        (now, ans_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO answers(content_hash, answer_text, "
+                        "  first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                        (h, r["answer_text"], now, now),
+                    )
+                    ans_id = cur.lastrowid
                 conn.execute(
-                    "UPDATE answers SET last_seen_at = ? WHERE id = ?",
-                    (now, ans_id),
+                    "UPDATE questions SET answer_id = ? WHERE pq_ref = ?",
+                    (ans_id, r["pq_ref"]),
                 )
-            else:
-                cur = conn.execute(
-                    "INSERT INTO answers(content_hash, answer_text, "
-                    "  first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
-                    (h, r["answer_text"], now, now),
-                )
-                ans_id = cur.lastrowid
-            conn.execute(
-                "UPDATE questions SET answer_id = ? WHERE pq_ref = ?",
-                (ans_id, r["pq_ref"]),
-            )
     # Backfill question_group_key for any row whose xml_raw exists but the
     # column wasn't yet populated (post-migration, or after the ingest path
     # changed). Idempotent — only touches rows where the computed key differs
@@ -304,6 +309,47 @@ def init_schema(conn: sqlite3.Connection) -> None:
                   replace(oireachtas_permalink, '/pq_', '/')
             WHERE oireachtas_permalink LIKE '%/pq_%'"""
     )
+    # FTS5 shape migration: old installs have `questions_fts` declared as
+    # `content='questions'` over (question_text, answer_text). New shape is
+    # inline-content over (question_text, answer_text, pq_ref UNINDEXED).
+    # Detect via the stored CREATE statement and rebuild from a JOIN.
+    fts_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='questions_fts'"
+    ).fetchone()
+    fts_sql = (fts_sql_row[0] if fts_sql_row else "") or ""
+    if "content='questions'" in fts_sql or "content=questions" in fts_sql:
+        conn.execute("DROP TABLE questions_fts")
+        conn.execute(
+            """CREATE VIRTUAL TABLE questions_fts USING fts5(
+                 question_text, answer_text,
+                 pq_ref UNINDEXED,
+                 tokenize='porter unicode61 remove_diacritics 2'
+               )"""
+        )
+        # Populate from JOIN through `answers`. Fall back to the legacy
+        # `questions.answer_text` column when it still exists and `answer_id`
+        # hasn't been backfilled (shouldn't happen post-backfill above, but
+        # COALESCE keeps the FTS coverage complete just in case).
+        if "answer_text" in cols:
+            conn.execute(
+                """INSERT INTO questions_fts(pq_ref, question_text, answer_text)
+                   SELECT q.pq_ref, q.question_text,
+                          COALESCE(a.answer_text, q.answer_text)
+                     FROM questions q
+                     LEFT JOIN answers a ON a.id = q.answer_id"""
+            )
+        else:
+            conn.execute(
+                """INSERT INTO questions_fts(pq_ref, question_text, answer_text)
+                   SELECT q.pq_ref, q.question_text, a.answer_text
+                     FROM questions q
+                     LEFT JOIN answers a ON a.id = q.answer_id"""
+            )
+    # DROP the legacy `questions.answer_text` column. The canonical store is
+    # now `answers(answer_text)` joined via `questions.answer_id`. Idempotent —
+    # SQLite 3.35+ supports DROP COLUMN; once dropped, the check above no-ops.
+    if "answer_text" in cols:
+        conn.execute("ALTER TABLE questions DROP COLUMN answer_text")
     conn.commit()
 
 
@@ -340,6 +386,27 @@ def upsert_member(conn: sqlite3.Connection, member_code: str, full_name: str,
           fetched_at=excluded.fetched_at
         """,
         (member_code, full_name, parties_json, constituencies_json, now),
+    )
+
+
+def refresh_fts_for_pq(conn: sqlite3.Connection, pq_ref: str,
+                       question_text: str | None,
+                       answer_text: str | None) -> None:
+    """Mirror current question+answer text into the inline-content FTS5 index.
+
+    Inline-content FTS5 doesn't auto-sync from the source tables (that was the
+    old `content='questions'` behaviour). Every code path that writes
+    question text or a new/changed answer must call this so search stays
+    correct. Delete-then-insert keeps the row count == question count.
+
+    NULL answer_text → store empty string (FTS5 won't index it but the row
+    must exist so the question_text side is searchable).
+    """
+    conn.execute("DELETE FROM questions_fts WHERE pq_ref = ?", (pq_ref,))
+    conn.execute(
+        """INSERT INTO questions_fts(pq_ref, question_text, answer_text)
+           VALUES (?, ?, ?)""",
+        (pq_ref, question_text or "", answer_text or ""),
     )
 
 
@@ -402,12 +469,12 @@ def upsert_question(conn: sqlite3.Connection, *,
               pq_ref, question_uri, date_asked, date_answered,
               td_name, td_member_code, td_party, td_constituency,
               department, minister_name,
-              question_text, answer_text, answer_id, answer_status,
+              question_text, answer_id, answer_status,
               matched_topics, oireachtas_permalink,
               xml_url, pdf_url, hse_pdf_url, constituent, notes,
               source, raw_question_showas, xml_raw,
               first_seen_at, last_updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
             """,
             (
                 pq_ref, question_uri,
@@ -415,7 +482,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_id, answer_status,
+                question_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink,
                 xml_url, pdf_url,
@@ -423,6 +490,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 now, now,
             ),
         )
+        refresh_fts_for_pq(conn, pq_ref, question_text, answer_text)
         return {"inserted": True, "newly_answered": answer_status == "answered"}
     # Update existing row. Preserve hse_pdf_url (manual attachment) and first_seen_at.
     was_pending = existing["answer_status"] == "pending"
@@ -442,7 +510,6 @@ def upsert_question(conn: sqlite3.Connection, *,
               department = ?,
               minister_name = ?,
               question_text = ?,
-              answer_text = ?,
               answer_id = ?,
               answer_status = ?,
               matched_topics = ?,
@@ -460,7 +527,7 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_id, answer_status,
+                question_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas, xml_raw,
@@ -481,7 +548,6 @@ def upsert_question(conn: sqlite3.Connection, *,
               department = ?,
               minister_name = ?,
               question_text = ?,
-              answer_text = ?,
               answer_id = ?,
               answer_status = ?,
               matched_topics = ?,
@@ -498,13 +564,14 @@ def upsert_question(conn: sqlite3.Connection, *,
                 date_answered.isoformat() if date_answered else None,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
-                question_text, answer_text, answer_id, answer_status,
+                question_text, answer_id, answer_status,
                 json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas,
                 now, pq_ref,
             ),
         )
+    refresh_fts_for_pq(conn, pq_ref, question_text, answer_text)
     return {"inserted": False, "newly_answered": was_pending and answer_status == "answered"}
 
 
@@ -757,6 +824,18 @@ def tags_by_pqref(conn: sqlite3.Connection) -> dict[str, list[str]]:
     for r in conn.execute("SELECT pq_ref, tag FROM tags ORDER BY pq_ref, tag"):
         out.setdefault(r[0], []).append(r[1])
     return out
+
+
+def answers_by_pqref(conn: sqlite3.Connection) -> dict[str, str]:
+    """Bulk-fetch answer text for every PQ that has one. JOIN-once pattern for
+    exports that would otherwise lookup `answers` per row."""
+    rows = conn.execute(
+        """SELECT q.pq_ref, a.answer_text
+             FROM questions q
+             JOIN answers a ON a.id = q.answer_id
+            WHERE q.answer_id IS NOT NULL"""
+    ).fetchall()
+    return {r["pq_ref"]: r["answer_text"] for r in rows}
 
 
 def upsert_hse_pdf(conn: sqlite3.Connection, *,
