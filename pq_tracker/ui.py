@@ -330,6 +330,51 @@ def log_app(msg: str) -> None:
         pass
 
 
+# Boilerplate prefix that every PQ question text starts with:
+#   "{agenda_num}. Deputy {Name}[, Deputy {Name}, ...] asked the {Minister Title}"
+# followed by the actual question. The minister title and TD identity are
+# already on the modal's summary strip, so the prefix is pure noise. Strip it
+# for display only — DB/FTS/exports keep the original.
+import re as _re_strip
+
+# HTML form rendered by akoma_html: <p>NUM. <strong>Deputy ...</strong> asked the <strong>TITLE</strong> ...
+# Accepts <b> too in case the renderer emits that.
+_BOILER_HTML = _re_strip.compile(
+    r'^(\s*<p[^>]*>)\s*\d+\.\s+'
+    r'<(?:strong|b)>\s*Deputy[^<]+</(?:strong|b)>\s+'
+    r'asked\s+the\s+'
+    r'<(?:strong|b)>\s*[^<]+</(?:strong|b)>\s*'
+)
+# Plain-text form. The minister title is a run of TitleCased words optionally
+# linked by short connectors (for/of/at/the/and/in) — e.g. "Minister of State
+# at the Department of Health". Stops at the first non-title word, which is
+# the start of the actual question ("if", "the reason", "to provide", etc).
+_BOILER_TEXT = _re_strip.compile(
+    r'^\s*\d+\.\s+Deputy\s+'
+    r'(?:[A-ZÀ-Ý][\w.\'\-À-ſ]*[,]?\s+)+'
+    r'asked\s+the\s+'
+    r'(?:'
+        r'[A-ZÀ-Ý][\w.\'\-À-ſ]*[,]?\s+'
+        r'|(?:(?:for|of|at|the|and|in)\s+)+(?=[A-ZÀ-Ý])'
+    r')+'
+)
+
+
+def _strip_question_boilerplate(text):
+    """Strip the agenda-number + 'Deputy X asked the Minister Y' prefix.
+    Returns input unchanged if no match. UI-only — do not apply to exports or
+    to text indexed for search."""
+    if not text:
+        return text
+    m = _BOILER_HTML.match(text)
+    if m:
+        return m.group(1) + '… ' + text[m.end():].lstrip()
+    m = _BOILER_TEXT.match(text)
+    if m:
+        return '… ' + text[m.end():].lstrip()
+    return text
+
+
 def _in_clause(col: str, values: list[str]) -> tuple[str, list]:
     """Build `col IN (?,?,...)` for a non-empty list. Returns ('', []) if empty."""
     if not values:
@@ -618,7 +663,7 @@ def api_get(pq_ref: str):
                 ).fetchone()
                 if hl is not None:
                     if "question" in domains and "<mark>" in (hl["hq"] or ""):
-                        d["question_html"] = hl["hq"]
+                        d["question_html"] = _strip_question_boilerplate(hl["hq"])
                     if "answer" in domains and "<mark>" in (hl["ha"] or ""):
                         d["answer_html"] = hl["ha"]
     # Fetch xml_raw separately (it's stripped by _row_to_dict for JSON safety).
@@ -636,6 +681,8 @@ def api_get(pq_ref: str):
             e_id = uri.rsplit("/", 1)[-1] if uri else ""
             if e_id:
                 q_html, a_html = akoma_html.render_question_and_answer(xml_raw, e_id)
+                if q_html:
+                    q_html = _strip_question_boilerplate(q_html)
                 if q_html and need_q:
                     d["question_html"] = q_html
                 if a_html and need_a:
@@ -1015,6 +1062,10 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
     # in shared responses. Callers that DO need it (modal-render only) fetch
     # the bytes via a dedicated query.
     d.pop("xml_raw", None)
+    # Strip the redundant "{NUM}. Deputy X asked the Minister for Y" prefix
+    # for display — TD + Minister are already on the modal summary strip.
+    if d.get("question_text"):
+        d["question_text"] = _strip_question_boilerplate(d["question_text"])
     # answer_text lives on `answers`, joined via answer_id. Inject here so
     # downstream callers (JSON modal, detail.html, markdown export) keep
     # seeing `d["answer_text"]` without each one repeating the JOIN.
