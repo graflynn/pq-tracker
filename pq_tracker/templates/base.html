@@ -159,6 +159,59 @@
   .chip-tag .x { margin-left: 5px; cursor: pointer; opacity: 0.6; }
   .chip-tag .x:hover { opacity: 1; }
 
+  /* "Group related" toggle in the action bar. */
+  .group-toggle { display: inline-flex; align-items: center; gap: 5px;
+                  font-size: 13px; color: var(--fg); cursor: pointer;
+                  user-select: none; padding: 0 4px; }
+  .group-toggle input { margin: 0; cursor: pointer; }
+
+  /* Grouped-row expander: a tight chevron at the start of the pq_ref cell.
+     Singletons get a same-width spacer so the PQ ref text stays vertically
+     aligned across rows. Group size lives in the tooltip, not in the chip. */
+  .group-toggle-btn, .group-toggle-spacer {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 16px; vertical-align: -3px;
+    margin-right: 4px; box-sizing: border-box;
+  }
+  .group-toggle-btn { background: transparent; border: none; padding: 0;
+                      cursor: pointer; color: var(--muted); border-radius: 3px; }
+  .group-toggle-btn:hover { color: var(--accent); background: #eef2ff; }
+  .group-toggle-btn .twisty-icon { transition: transform 0.12s ease; }
+  tr.group-expanded .group-toggle-btn { color: var(--accent); }
+  tr.group-expanded .twisty-icon { transform: rotate(90deg); }
+
+  /* Card-style left accent on every row's pq_ref cell. Three tiers:
+       - default (singleton)     : faint gray, just hints at row boundary
+       - .row-group-canonical    : solid accent — this is a group header
+       - .row-sibling            : matching accent + tinted bg, hidden until
+                                   the canonical's twisty is clicked
+     Sibling rows render as <tr>s so column visibility + the row-click
+     modal handler work unchanged. */
+  /* Singletons get a faint blue card tint + blue left accent. */
+  tr.clickable td { background: #f5f9ff; }
+  tr.clickable td.pq-ref {
+    box-shadow: inset 3px 0 0 #7da8e8;
+    padding-left: 10px;
+  }
+  /* Group canonical + siblings share the same green tint — they're one
+     conceptual unit and the only thing distinguishing them visually is the
+     accent shade (header darker, members lighter). Sibling rows stay
+     hidden until the canonical's twisty is clicked. */
+  tr.clickable.row-group-canonical td,
+  tr.clickable.row-sibling td { background: #eaf6ee; }
+  tr.clickable.row-group-canonical td.pq-ref {
+    box-shadow: inset 3px 0 0 #4ea974;
+  }
+  tr.clickable.row-sibling { display: none; }
+  tr.clickable.row-sibling.row-sibling-shown { display: table-row; }
+  tr.clickable.row-sibling td.pq-ref {
+    box-shadow: inset 3px 0 0 #9bd0b1;
+  }
+  /* Hover overrides the per-row tint with a uniform highlight. */
+  tr.clickable:hover td { background: #eef2ff; }
+  tr.clickable.row-group-canonical:hover td,
+  tr.clickable.row-sibling:hover td { background: #dceee4; }
+
   /* Tag editor input. */
   .tag-editor { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px;
                 border: 1px solid var(--border); border-radius: 5px; background: white;

@@ -15,6 +15,11 @@
      title="Download the current filtered view as an .xlsx file">
     ⬇ Export to Excel
   </a>
+  <label class="group-toggle"
+         title="When a minister groups multiple PQs under one answer, collapse them to a single row showing the lowest-numbered member. Other members surface as a chip.">
+    <input type="checkbox" id="group-toggle" {% if f.group %}checked{% endif %}>
+    <span>Group related</span>
+  </label>
   <span style="color:var(--muted);font-size:12px;align-self:center;">
     Click any row for full details + edit.
     Blue chips = auto-tags (from <code>topics.yaml</code> via
@@ -139,11 +144,45 @@
       </th>
     </tr>
   </thead>
-  <tbody id="rows">
-    {% for r in rows %}
-    <tr class="clickable" data-pqref="{{ r.pq_ref }}">
-      <td class="pq-ref col col-pq_ref" data-col="pq_ref"><a href="{{ url_for('detail_view', pq_ref=r.pq_ref) }}"
-                            onclick="event.stopPropagation();">{{ r.pq_ref }}</a></td>
+  {# Single source-of-truth for one PQ row. `is_sibling` flips the pq_ref
+     cell to a sibling-marker variant and adds the row classes the expand JS
+     keys on. The cells themselves are identical so column visibility +
+     existing row-click handlers work for siblings out of the box. #}
+  {% macro pq_row(r, is_sibling=False, parent_pq=None) %}
+    {# Row class flavour:
+         row-sibling        : hidden grouped-PQ shown when canonical expands
+         row-group-canonical: standalone row that's *part of* a Oireachtas
+                              group (per its XML), regardless of whether the
+                              current filter/search pulled in any siblings.
+                              Twisty rendered only when there ARE siblings to
+                              expand — the styling alone signals "this is in
+                              a wider group, open the modal to see them all."
+         (otherwise)        : true singleton PQ (no group in XML)
+       Each gets a distinct left-accent in CSS for the card-style look. #}
+    <tr class="clickable {% if is_sibling %}row-sibling{% elif f.group and r.group_full_size > 1 %}row-group-canonical{% endif %}"
+        data-pqref="{{ r.pq_ref }}"
+        {% if is_sibling %}data-parent-pq="{{ parent_pq }}"{% endif %}>
+      <td class="pq-ref col col-pq_ref" data-col="pq_ref">
+        {% if is_sibling %}
+          <span class="group-toggle-spacer" aria-hidden="true"></span>
+        {% elif f.group and r.group_in_corpus_size > 1 %}
+          <button type="button" class="group-toggle-btn"
+                  data-pq-ref="{{ r.pq_ref }}"
+                  aria-expanded="false"
+                  aria-label="Expand {{ r.group_in_corpus_size - 1 }} grouped PQ(s)"
+                  title="Grouped with {{ r.group_in_corpus_size - 1 }} other PQ(s) in our corpus{% if r.group_full_size > r.group_in_corpus_size %} (plus {{ r.group_full_size - r.group_in_corpus_size }} off-corpus){% endif %}. Click to expand inline.">
+            <svg class="twisty-icon" viewBox="0 0 10 10" width="9" height="9"
+                 fill="none" stroke="currentColor" stroke-width="1.7"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="3.5 2 6.5 5 3.5 8"/>
+            </svg>
+          </button>
+        {% else %}
+          <span class="group-toggle-spacer" aria-hidden="true"></span>
+        {% endif %}
+        <a href="{{ url_for('detail_view', pq_ref=r.pq_ref) }}"
+           onclick="event.stopPropagation();">{{ r.pq_ref }}</a>
+      </td>
       <td class="col col-date_asked" data-col="date_asked">{{ r.date_asked }}</td>
       <td class="col col-td_name td-cell" data-col="td_name">
         <div class="td-line1">
@@ -179,6 +218,16 @@
       <td class="cell-constituent col col-constituent" data-col="constituent">{{ r.constituent or '' }}</td>
       <td class="cell-notes col col-notes" data-col="notes">{% if r.notes %}<span title="{{ r.notes }}">●</span>{% endif %}</td>
     </tr>
+  {% endmacro %}
+
+  <tbody id="rows">
+    {% for r in rows %}
+      {{ pq_row(r) }}
+      {% if f.group and r.group_members %}
+        {% for sib in r.group_members %}
+          {{ pq_row(sib, is_sibling=True, parent_pq=r.pq_ref) }}
+        {% endfor %}
+      {% endif %}
     {% else %}
     <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:30px;">No matching questions.</td></tr>
     {% endfor %}
@@ -776,6 +825,9 @@
     const tr = e.target.closest('tr.clickable');
     if (!tr) return;
     if (e.target.closest('a')) return;
+    // The group-expander button lives inside the row but has its own click
+    // handler (toggles sibling rows). Bail out so we don't also open the modal.
+    if (e.target.closest('.group-toggle-btn')) return;
     open(tr.dataset.pqref, tr);
   });
 
@@ -1217,6 +1269,46 @@ const FILTER_LABEL = {
       openPopover(colsBtn, renderColsChooser());
     });
   }
+
+  // Group-related toggle — updates ?group= and resets to page 1 (collapsing
+  // can shrink the result set so the current page may be past the end).
+  const groupToggle = document.getElementById('group-toggle');
+  if (groupToggle) {
+    groupToggle.addEventListener('change', function () {
+      const u = new URL(window.location.href);
+      if (groupToggle.checked) {
+        u.searchParams.delete('group');     // default is on, omit param
+      } else {
+        u.searchParams.set('group', '0');
+      }
+      u.searchParams.delete('page');
+      window.location.href = u.toString();
+    });
+  }
+
+  // Twisty buttons on grouped rows: expand the sibling rows inline.
+  // Sibling rows are rendered hidden by CSS (.row-sibling) and revealed when
+  // the parent has .group-expanded set on it. Toggling a class on the parent
+  // beats individually toggling every sibling since one PQ can have 13+
+  // siblings (n=19 group exists).
+  document.getElementById('rows').addEventListener('click', function (e) {
+    const btn = e.target.closest('.group-toggle-btn');
+    if (!btn) return;
+    e.stopPropagation();   // don't trigger the row-open-modal handler
+    const tr = btn.closest('tr');
+    if (!tr) return;
+    const pqRef = btn.dataset.pqRef;
+    const expanded = tr.classList.toggle('group-expanded');
+    btn.setAttribute('aria-expanded', String(expanded));
+    // The chevron SVG rotates via CSS keyed on the .group-expanded class —
+    // no per-character swap needed here.
+    // Show/hide all sibling rows whose data-parent-pq matches this canonical.
+    document.querySelectorAll(
+      'tr.row-sibling[data-parent-pq="' + (window.CSS && CSS.escape ? CSS.escape(pqRef) : pqRef) + '"]'
+    ).forEach(function (s) {
+      s.classList.toggle('row-sibling-shown', expanded);
+    });
+  });
 
   // Toggling a column checkbox inside the chooser updates state immediately.
   popBody.addEventListener('change', function (e) {

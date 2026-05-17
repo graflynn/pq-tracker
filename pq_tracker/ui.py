@@ -129,10 +129,15 @@ def _parse_filters(args) -> dict:
     sort = sort_raw if sort_raw in _SORT_COLS else ""
     dir_raw = (args.get("dir") or "").strip().lower()
     direction = dir_raw if dir_raw in ("asc", "desc") else ("desc" if sort else "")
+    # Grouping toggle. Default on — see project memory, the user wants grouped
+    # rows by default. `?group=0` flattens.
+    group_raw = (args.get("group") or "").strip()
+    group_on = group_raw != "0"
     return {
         "q": (args.get("q") or "").strip(),
         "domains": domains,
         "indexes": indexes,
+        "group": group_on,
         # Multi-select column filters.
         "td": _multi(args, "td"),
         "party": _multi(args, "party"),
@@ -397,46 +402,93 @@ def list_view():
     page = max(1, int(request.args.get("page", 1)))
     offset = (page - 1) * PAGE_SIZE
     where, params = _build_where(f)
-    # Explicit column-header sort (if any) overrides relevance / date defaults.
     sort_col = _SORT_COLS.get(f["sort"], "")
     sort_dir = f["dir"].upper() if f["dir"] in ("asc", "desc") else "DESC"
+    grouped = f["group"]
     with _conn() as conn:
-        # Search prefilter: if the unified q is set, narrow to ranked candidate
-        # pq_refs. When also sorted by column, sort overrides relevance.
         search_refs, score_map = _search_prefilter(conn, f)
+        # Build the matched-row set the same way regardless of grouping: when
+        # search is on, narrow to ranked candidates; otherwise apply WHERE.
+        # In grouped mode we *also* need to pull in the matched rows' siblings
+        # so a group surfaces even when the canonical itself was filtered out.
         if search_refs is not None:
             if not search_refs:
-                rows = []
-                total = 0
+                base_rows: list = []
             else:
                 placeholders = ",".join("?" * len(search_refs))
                 where_combined = where + (" AND " if where else " WHERE ") + f"pq_ref IN ({placeholders})"
-                params_combined = params + list(search_refs)
-                total = conn.execute(
-                    f"SELECT COUNT(*) FROM questions{where_combined}", params_combined
-                ).fetchone()[0]
-                rows_all = conn.execute(
-                    f"SELECT * FROM questions{where_combined}", params_combined
+                base_rows = conn.execute(
+                    f"SELECT * FROM questions{where_combined}",
+                    params + list(search_refs),
                 ).fetchall()
-                if sort_col:
-                    rows_all = sorted(
-                        rows_all,
-                        key=lambda r: ((r[sort_col] is None), r[sort_col] or ""),
-                        reverse=(sort_dir == "DESC"),
-                    )
-                else:
-                    rows_all.sort(key=lambda r: -score_map.get(r["pq_ref"], 0.0))
-                rows = rows_all[offset:offset + PAGE_SIZE]
         else:
-            total = conn.execute(f"SELECT COUNT(*) FROM questions{where}", params).fetchone()[0]
-            order_by = (
-                f"{sort_col} {sort_dir}, pq_ref" if sort_col
-                else "date_asked DESC, pq_ref"
-            )
-            rows = conn.execute(
-                f"SELECT * FROM questions{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
-                params + [PAGE_SIZE, offset],
+            base_rows = conn.execute(
+                f"SELECT * FROM questions{where}", params,
             ).fetchall()
+
+        if grouped:
+            # Group ONLY the matching rows — don't pull in non-matching
+            # siblings. A group surfaces as expandable only when ≥2 of its
+            # members made it through the filter/search. If only one did, it
+            # renders as a regular singleton (no twisty) — exactly as if it
+            # were never grouped. The full Oireachtas grouping is still
+            # discoverable via the modal's "shared with" panel.
+            display = _collapse_groups(base_rows)
+            # Sort the collapsed list. Sort precedence:
+            #   1. explicit column sort (?sort=...) — by canonical's column
+            #   2. search relevance — by canonical's score
+            #   3. default: date_asked DESC then pq_ref
+            if sort_col:
+                display.sort(
+                    key=lambda d: ((d.get(sort_col) is None), d.get(sort_col) or ""),
+                    reverse=(sort_dir == "DESC"),
+                )
+            elif search_refs is not None:
+                # Group's score = max score across its in-corpus members so a
+                # group with one strong-matching member ranks above another
+                # whose only matches are weak.
+                def group_score(d: dict) -> float:
+                    refs = [d["pq_ref"]] + [m["pq_ref"] for m in d["group_members"]]
+                    return max((score_map.get(r, 0.0) for r in refs), default=0.0)
+                display.sort(key=lambda d: -group_score(d))
+            else:
+                display.sort(
+                    key=lambda d: (d.get("date_asked") or "", d["pq_ref"]),
+                    reverse=True,
+                )
+            total = len(display)
+            rows = display[offset:offset + PAGE_SIZE]
+        else:
+            # Flat (ungrouped) mode — original behaviour.
+            if search_refs is not None:
+                if not base_rows:
+                    rows = []
+                    total = 0
+                else:
+                    rows_all = list(base_rows)
+                    if sort_col:
+                        rows_all = sorted(
+                            rows_all,
+                            key=lambda r: ((r[sort_col] is None), r[sort_col] or ""),
+                            reverse=(sort_dir == "DESC"),
+                        )
+                    else:
+                        rows_all.sort(key=lambda r: -score_map.get(r["pq_ref"], 0.0))
+                    total = len(rows_all)
+                    rows = rows_all[offset:offset + PAGE_SIZE]
+            else:
+                total = len(base_rows)
+                # Re-issue with ORDER BY + LIMIT to leverage SQLite indexes
+                # rather than pulling everything into Python for the unfiltered
+                # default view.
+                order_by = (
+                    f"{sort_col} {sort_dir}, pq_ref" if sort_col
+                    else "date_asked DESC, pq_ref"
+                )
+                rows = conn.execute(
+                    f"SELECT * FROM questions{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                    params + [PAGE_SIZE, offset],
+                ).fetchall()
         tds = db.distinct_values(conn, "td_name")
         parties = db.distinct_values(conn, "td_party")
         constituencies = db.distinct_values(conn, "td_constituency")
@@ -448,12 +500,8 @@ def list_view():
         ).fetchone()[0]
         total_in_db = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    # Bulk-load tags so the list view can show chips per row without N+1 queries.
     with _conn() as conn2:
         tags_map = db.tags_by_pqref(conn2)
-        # Bulk-load: for each pq_ref, the lowest-id HSE PDF that has a local
-        # copy. Used to show a 📄 icon on the question cell that opens the PDF
-        # in a modal — visual cue that there's an HSE response available.
         hse_pdf_map: dict[str, int] = {}
         for r2 in conn2.execute(
             """SELECT j.pq_ref, MIN(p.id) AS pdf_id
@@ -463,11 +511,22 @@ def list_view():
                 GROUP BY j.pq_ref"""
         ):
             hse_pdf_map[r2["pq_ref"]] = r2["pdf_id"]
+    def _enrich(d: dict) -> dict:
+        d["tags"] = tags_map.get(d["pq_ref"], [])
+        d["hse_pdf_id"] = hse_pdf_map.get(d["pq_ref"])
+        return d
+
     enriched = []
     for r in rows:
-        d = _row_to_dict(r)
-        d["tags"] = tags_map.get(d["pq_ref"], [])
-        d["hse_pdf_id"] = hse_pdf_map.get(d["pq_ref"])  # None when no local PDF
+        # In grouped mode, `r` is already a dict (from _collapse_groups). Its
+        # `group_members` (if any) also need tag + HSE enrichment so siblings
+        # render with the same affordances as their canonical when expanded.
+        # In flat mode, `r` is a sqlite3.Row that still needs _row_to_dict.
+        d = r if isinstance(r, dict) else _row_to_dict(r)
+        _enrich(d)
+        for sib in d.get("group_members", []) or []:
+            if isinstance(sib, dict):
+                _enrich(sib)
         enriched.append(d)
     return render_template(
         "list.html",
@@ -793,6 +852,66 @@ def api_save(pq_ref: str):
     return jsonify({"ok": False, "error": f"DB busy after retries: {last_err}"}), 503
 
 
+def _full_group_size(group_key: str | None) -> int:
+    """Count the eIds in a stored group key. Returns 1 for singletons / NULL."""
+    if not group_key or "|" not in group_key:
+        return 1
+    try:
+        return len(group_key.split("|", 1)[1].split(","))
+    except (IndexError, ValueError):
+        return 1
+
+
+def _agenda_num(row_or_dict) -> int:
+    """Numeric agenda number from ``question_uri`` for canonical-row picks."""
+    uri = row_or_dict["question_uri"] if row_or_dict["question_uri"] else ""
+    eid = uri.rsplit("/", 1)[-1]
+    if eid.startswith("pq_"):
+        try:
+            return int(eid[3:])
+        except ValueError:
+            pass
+    return 10**9
+
+
+def _collapse_groups(rows: list) -> list[dict]:
+    """Collapse rows that share a ``question_group_key`` to one display dict.
+
+    Each collapsed dict carries:
+      - all _row_to_dict fields of the canonical (lowest-agenda-number) member
+      - ``group_full_size``: total members per the Oireachtas XML (covers
+        siblings not in our corpus too — read from the key)
+      - ``group_in_corpus_size``: how many of those members are in our DB
+        AND match the current filter set (the rows we were handed)
+      - ``group_members``: list of FULL _row_to_dict dicts for the
+        OTHER (non-canonical) in-corpus siblings — same shape as canonical,
+        so the template can render them as inline expand-rows. The caller
+        is responsible for enriching `tags` / `hse_pdf_id` on both canonical
+        and siblings (since those need DB lookups outside this function).
+
+    Rows without a ``question_group_key`` stand alone (treated as singletons).
+    """
+    by_key: dict[str, list] = {}
+    for r in rows:
+        k = r["question_group_key"]
+        bucket = k if k else f"_solo:{r['pq_ref']}"
+        by_key.setdefault(bucket, []).append(r)
+    out: list[dict] = []
+    for bucket, members in by_key.items():
+        members.sort(key=_agenda_num)
+        d = _row_to_dict(members[0])
+        if bucket.startswith("_solo:"):
+            d["group_full_size"] = 1
+            d["group_in_corpus_size"] = 1
+            d["group_members"] = []
+        else:
+            d["group_full_size"] = _full_group_size(bucket)
+            d["group_in_corpus_size"] = len(members)
+            d["group_members"] = [_row_to_dict(m) for m in members[1:]]
+        out.append(d)
+    return out
+
+
 def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
                  *, with_shared: bool = False) -> dict:
     d = dict(row)
@@ -804,6 +923,14 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
         d["matched_topics_list"] = json.loads(d.get("matched_topics") or "[]")
     except json.JSONDecodeError:
         d["matched_topics_list"] = []
+    # Full Oireachtas group size for this PQ (= number of eIds in the shared
+    # XML, or 1 for singletons). Useful for the list-view "+N grouped" chip
+    # even when the grouping toggle is off — surfaces that the row is part
+    # of a wider group regardless of how it's being rendered. The list-view
+    # collapse path overwrites `group_in_corpus_size` and `group_members`.
+    d["group_full_size"] = _full_group_size(d.get("question_group_key"))
+    d["group_in_corpus_size"] = 1
+    d["group_members"] = []
     if conn is not None:
         d["tags"] = db.get_tags(conn, d["pq_ref"])
         d["hse_pdfs"] = db.get_hse_pdfs_for_pq(conn, d["pq_ref"])

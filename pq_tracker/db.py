@@ -220,6 +220,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
                      "REFERENCES answers(id)")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_q_answer_id "
                      "  ON questions(answer_id)")
+    if "question_group_key" not in cols:
+        # Deterministic key shared by every member of a minister-grouped
+        # question set. NULL for singletons and for the rare eId-mismatch
+        # rows. Backfilled below from xml_raw; ingest path keeps it fresh.
+        conn.execute("ALTER TABLE questions ADD COLUMN question_group_key TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_q_group_key "
+                     "  ON questions(question_group_key)")
     # Backfill answers/answer_id idempotently. Each run hashes every answered
     # row missing an answer_id, upserts into `answers`, and points back.
     # No-op once everything's wired (the WHERE eliminates touched rows).
@@ -253,6 +260,24 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE questions SET answer_id = ? WHERE pq_ref = ?",
                 (ans_id, r["pq_ref"]),
+            )
+    # Backfill question_group_key for any row whose xml_raw exists but the
+    # column wasn't yet populated (post-migration, or after the ingest path
+    # changed). Idempotent — only touches rows where the computed key differs
+    # from what's stored, and skips rows without xml_raw.
+    pending_keys = conn.execute(
+        """SELECT pq_ref, date_asked, question_uri, xml_raw, question_group_key
+             FROM questions
+            WHERE xml_raw IS NOT NULL AND xml_raw != ''
+              AND question_group_key IS NULL"""
+    ).fetchall()
+    for r in pending_keys:
+        my_eid = (r["question_uri"] or "").rsplit("/", 1)[-1]
+        key = _group_key_for(r["xml_raw"], r["date_asked"], my_eid)
+        if key != r["question_group_key"]:
+            conn.execute(
+                "UPDATE questions SET question_group_key = ? WHERE pq_ref = ?",
+                (key, r["pq_ref"]),
             )
     hse_cols = {row[1] for row in conn.execute("PRAGMA table_info(hse_pdfs)")}
     if "text_extraction_status" not in hse_cols:
@@ -534,6 +559,49 @@ def get_question(conn: sqlite3.Connection, pq_ref: str) -> sqlite3.Row | None:
 
 
 _Q_EID_RE = re.compile(r'<question\s+[^>]*?eId="([^"]+)"')
+
+
+def _group_key_for(xml_raw: bytes | str | None, date_asked: str,
+                   my_eid: str) -> str | None:
+    """Deterministic key shared by every member of a minister-grouped question.
+
+    Returns ``None`` when the PQ is a singleton (no XML, only one ``<question>``
+    eId, or the eId-mismatch case where our own eId isn't in the XML's set).
+
+    Format: ``"<date_asked>|pq_NNN,pq_MMM,..."`` with eIds sorted lexicographically.
+    Every group member computes the same key independently from its own
+    ``xml_raw`` — no rowid coupling, so the key is stable across prunes /
+    re-inserts.
+    """
+    if not xml_raw:
+        return None
+    if isinstance(xml_raw, (bytes, bytearray)):
+        xml_text = bytes(xml_raw).decode("utf-8", errors="replace")
+    else:
+        xml_text = xml_raw
+    eids = _Q_EID_RE.findall(xml_text)
+    if len(eids) <= 1:
+        return None
+    if my_eid not in eids:
+        return None
+    return f"{date_asked}|" + ",".join(sorted(eids))
+
+
+def update_group_key_for_pq(conn: sqlite3.Connection, pq_ref: str) -> str | None:
+    """Recompute & persist ``question_group_key`` for one PQ. Returns the new key."""
+    row = conn.execute(
+        "SELECT date_asked, question_uri, xml_raw FROM questions WHERE pq_ref = ?",
+        (pq_ref,),
+    ).fetchone()
+    if row is None:
+        return None
+    my_eid = (row["question_uri"] or "").rsplit("/", 1)[-1]
+    key = _group_key_for(row["xml_raw"], row["date_asked"], my_eid)
+    conn.execute(
+        "UPDATE questions SET question_group_key = ? WHERE pq_ref = ?",
+        (key, pq_ref),
+    )
+    return key
 
 
 def get_group_siblings(conn: sqlite3.Connection, pq_ref: str) -> dict:

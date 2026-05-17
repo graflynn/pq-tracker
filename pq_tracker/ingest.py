@@ -109,6 +109,8 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
                 emb.embed_pq(conn, row["pq_ref"], final_q, qa.answer_text)
             except Exception as ee:  # noqa: BLE001
                 log.warning("embed failed for %s: %s", row["pq_ref"], ee)
+            # Refresh the group key — the new xml_raw might change membership.
+            db.update_group_key_for_pq(conn, row["pq_ref"])
             conn.commit()
             newly_answered += 1
             log.info("pending re-poll: %s → answered", row["pq_ref"])
@@ -238,6 +240,12 @@ def run(lookback_days: int | None = None, start_date: date | None = None,
                         emb.embed_pq(conn, entry.pq_ref, final_q, qa.answer_text)
                     except Exception as ee:  # noqa: BLE001
                         log.warning("embed failed for %s: %s", entry.pq_ref, ee)
+                    # Persist group key for the new/updated row. Note: when this
+                    # row joins an existing group, the OTHER members' keys are
+                    # already correct (they computed the same key from their own
+                    # xml_raw — keys are independent of which row gets ingested
+                    # first), so no fan-out update is needed.
+                    db.update_group_key_for_pq(conn, entry.pq_ref)
                     # Commit per-match so the write lock isn't held across the next
                     # network roundtrip — keeps the UI responsive while a long backfill
                     # runs in parallel. WAL makes per-row commits cheap.
