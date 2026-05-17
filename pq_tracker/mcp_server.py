@@ -21,11 +21,27 @@ from mcp.server.fastmcp import FastMCP
 API_BASE = os.environ.get("PQ_API_BASE", "http://127.0.0.1:5454/api/v1")
 TOKEN = (os.environ.get("PQ_API_TOKEN") or "").strip()
 
+# (connect_timeout, read_timeout). Connect failure (server down) returns in
+# under a second; read timeout is generous for /semantic which loads the
+# embedding matrix on the first call.
+_TIMEOUT = (3, 60)
+
 mcp = FastMCP("pq-tracker")
 
 
 def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+
+
+def _server_down_message() -> str:
+    return (
+        f"The PQ tracker Flask server is not reachable at {API_BASE}. "
+        "Please ask the user to double-click the 'PQ Server!' shortcut on "
+        "their desktop (it opens a console window with the live logs), wait "
+        "a few seconds for Flask to bind to port 5454, then retry the tool "
+        "call. If the shortcut is missing, the launcher is at "
+        "C:\\Users\\Grainne\\Documents\\pq-tracker\\start-server.cmd."
+    )
 
 
 def _get(path: str, **params: Any) -> dict:
@@ -41,14 +57,20 @@ def _get(path: str, **params: Any) -> dict:
                     qs.append((k, str(item)))
         else:
             qs.append((k, str(v)))
-    r = requests.get(f"{API_BASE}{path}", params=qs, headers=_headers(), timeout=60)
+    try:
+        r = requests.get(f"{API_BASE}{path}", params=qs, headers=_headers(), timeout=_TIMEOUT)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        raise RuntimeError(_server_down_message()) from None
     if r.status_code >= 500:
         r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: dict) -> dict:
-    r = requests.post(f"{API_BASE}{path}", json=body, headers=_headers(), timeout=60)
+    try:
+        r = requests.post(f"{API_BASE}{path}", json=body, headers=_headers(), timeout=_TIMEOUT)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        raise RuntimeError(_server_down_message()) from None
     # 4xx bodies carry useful error messages (e.g. bad SQL) — pass them through.
     if r.status_code >= 500:
         r.raise_for_status()
