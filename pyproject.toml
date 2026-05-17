@@ -12,4 +12,5 @@ dependencies = [
     "fastembed>=0.4.0",
     "numpy>=2.0",
     "pymupdf>=1.24",
+    "mcp>=1.0",
 ]

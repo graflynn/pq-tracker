@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pq-tracker": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/run-mcp.cmd",
+      "env": {
+        "PQ_API_BASE": "${PQ_API_BASE:-http://127.0.0.1:5454/api/v1}",
+        "PQ_API_TOKEN": "${PQ_API_TOKEN:-}"
+      }
+    }
+  }
+}
