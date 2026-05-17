@@ -6,6 +6,15 @@ description: Use this skill to research, analyse, and report on Irish health-rel
 
 You are helping with research over a local corpus of Irish health-related parliamentary questions (PQs). PQs are written questions asked by TDs (Deputies / Teachtaí Dála) to the Minister for Health (and adjacent ministers); the answers are recorded in the Oireachtas record and sometimes accompanied by longer HSE supplementary PDF replies.
 
+## Before significant work, read the issues log
+
+Before starting non-trivial pq-tracker work, look for an `ISSUES.md` file in the user's pq-tracker project folder (typically `C:\Users\Grainne\Documents\pq-tracker\ISSUES.md`). It logs known plugin / skill / Cowork-API quirks, their workarounds, and which entries are resolved. Respect the entry format documented at the top of that file when appending new ones.
+
+User shortcuts for the log:
+
+- **"log it"** — append a new entry with today's date and the conventions at the top of the file (Area / Severity / Symptom / Diagnosis / Workaround / Suggested fix).
+- **"close that one"** — mark the matching entry **Resolved: YYYY-MM-DD** at the bottom, with a brief note on what shipped.
+
 ## What the `pq-tracker` MCP tools give you
 
 Eight tools, all read-only, all wrapping a local Flask API at `http://127.0.0.1:5454/api/v1`. The Flask app must be running (`start-server.cmd`). If a tool call fails with a connection error, tell the user — don't silently fail.
@@ -13,9 +22,9 @@ Eight tools, all read-only, all wrapping a local Flask API at `http://127.0.0.1:
 | Tool | When to reach for it |
 |---|---|
 | `pq_facets` | First call when the user names a constituency / TD / minister / tag and you don't know the exact spelling. Returns every distinct value plus the date range and total. Cheap (<10 ms). |
-| `pq_list` | Filter + paginate. FTS5-ranked when `q` is given. Returns compact rows with a snippet — not full text. |
+| `pq_list` | Filter + paginate. FTS5-ranked when `q` is given. Returns compact rows with a snippet — not full text. Supports `compact=True` and `fields=[...]` to keep payloads small when you only need a few columns for grouping. |
 | `pq_get` | One PQ, full body. Use after `pq_list` when you need the actual question and answer text. |
-| `pq_aggregate` | Counts grouped by constituency / member / party / minister / department / status / month / year / tag. The workhorse for *any* "report" or "trends" question. |
+| `pq_aggregate` | Counts grouped by constituency / member / party / minister / department / status / month / year / tag. Pass `group_by_2` for a 2D matrix (heatmap-shaped). The workhorse for *any* "report" or "trends" question. |
 | `pq_semantic_search` | Paraphrase / synonym / vague-concept search. BGE-small embeddings. Sources: `question`, `answer`, `hse_paragraph`. |
 | `hse_list` | Find HSE supplementary PDFs, especially via `pq_ref` to see what's attached to a specific PQ. |
 | `hse_get` | Full extracted paragraphs of one PDF. Cite specific pages. |
@@ -28,6 +37,21 @@ Eight tools, all read-only, all wrapping a local Flask API at `http://127.0.0.1:
 - **`pq_aggregate` before listing** when the question is "how many" / "where" / "when" / "who most often" / "trend". Don't fetch 200 PQs to count them — count first, list only what's interesting.
 - **`pq_list` returns snippets, not full text**. If the snippets are enough to answer the question, stop. Only call `pq_get` when the agent actually needs the full answer body.
 - **HSE PDFs are often the substantive reply** — when a `pq_get` answer is short and refers to "as set out in the attached", check `hse_pdfs` in the response and fetch with `hse_get`.
+- **Keep `pq_list` payloads small.** With ~120 rows the default shape can blow past the agent's tool-output cap. Use `compact=True` when you need full rows but smaller; use `fields=["pq_ref","constituency","member"]` (or similar) when you only need columns for client-side grouping. Reach for `compact=True` by default whenever `limit > 50`.
+- **For 2D matrices, prefer `pq_aggregate` with `group_by_2`** over either looping single-axis aggregates or reaching for `pq_sql`. One round-trip, server-side DISTINCT counting, no double-counting from tag joins.
+
+## Choosing the output format
+
+The plugin's tools are the data source — they are not opinionated about how you present the result. Pick the deliverable to match what the user actually wants:
+
+- **Plain text answer in chat** — fine for short factual questions ("how many CGM PQs in 2025?").
+- **Markdown table** — the default for "list the top N" or small matrices that fit on one screen.
+- **Static chart (PNG / SVG via matplotlib or seaborn in the sandbox)** — the most reliable way to render a heatmap, bar chart, or trend line. Render the chart in Python, save to a file, and surface it.
+- **Spreadsheet (xlsx)** — when the user wants the underlying data with conditional formatting or a pivot they can re-slice. Use the xlsx skill.
+- **Word / PPT (docx / pptx)** — when the deliverable is a written report or a slide for a meeting. Use the corresponding skill.
+- **Cowork artifact (live, refreshable)** — only when the user explicitly wants interactivity (e.g. dropdown to switch tag, live re-fetch). Artifacts have more failure modes than static outputs — `window.cowork.callMcpTool` timing, response-shape quirks, and CDN/CSP restrictions. Don't default to them when a static image will do.
+
+Rule of thumb: if you find yourself debugging the artifact bridge, you have probably overshot the user's need — fall back to a matplotlib PNG.
 
 ## Combining with other sources
 
@@ -93,6 +117,35 @@ These are the patterns Grainne typically asks for. Recognise them and structure 
 2. `pq_list member=[name] limit=20` — recent questions
 3. `pq_aggregate group_by=year member=[name]` — how active over time
 4. Output: a brief on what this TD has been raising and how often.
+
+### Heatmap / 2D matrix
+
+"A heatmap of X by Y" almost always means a true 2D matrix, not a 1D
+shaded list. Before building anything, confirm:
+
+- **Rows axis** — usually constituency, but ask if not obvious.
+- **Columns axis** — year / month / tag / TD / party / status.
+- **Scope filter** — which tag set or FTS phrase narrows the universe
+  (e.g. `tag=["cgm"]`, or `q="insulin pump"`).
+- **Normalisation** — raw count (default), per-capita (rare; need
+  external population data), or share-of-row (`count / row_total`).
+
+Recipe:
+
+1. `pq_aggregate group_by=<rows> group_by_2=<cols> [filters] limit=2000`
+   — one round-trip returns `[{key, key_2, count}]` cells.
+2. Pivot in Python (pandas `crosstab` / `pivot_table`) — fill missing
+   cells with 0 so the matrix is rectangular.
+3. Render with matplotlib `imshow` or seaborn `heatmap`. Save as PNG.
+   Don't try to render this in a Cowork artifact unless the user
+   specifically asked for interactivity — see "Choosing the output
+   format" above.
+
+Ragged-matrix fallback: when one axis is "everything matching this
+filter, no aggregation," use `pq_list(..., compact=True,
+fields=["pq_ref", "<rows>", "<cols>"], limit=500)` and group
+client-side. Do NOT reach for `pq_sql` for this shape — `fields=` was
+added precisely so SQL isn't the right tool.
 
 ## When to use `pq_sql`
 

@@ -270,6 +270,14 @@ def list_pqs():
       q                     — FTS5 search; when present, drives ordering
       limit (default 50, max 500), offset (default 0)
 
+    Payload-size knobs (use these when the result set is big):
+      compact=true          — drop tags/minister/department/permalink and
+                              halve the snippet to ~120 chars.
+      fields=a,b,c          — whitelist response keys (pq_ref always kept).
+                              Combine with the filters you actually need
+                              for downstream grouping — e.g.
+                              fields=pq_ref,constituency,member.
+
     Returns compact rows + snippet. Full text on /pq/<ref>.
     """
     args = request.args
@@ -281,6 +289,12 @@ def list_pqs():
         return jsonify({"error": "limit/offset must be integers", "code": 400}), 400
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
+
+    # Payload trimmers — applied at the end before serialising.
+    fields_raw = (args.get("fields") or "").strip()
+    fields = {f.strip() for f in fields_raw.split(",") if f.strip()} if fields_raw else None
+    compact = (args.get("compact") or "").strip().lower() in ("1", "true", "yes")
+    snippet_cap = 120 if compact else 240
 
     filter_where, filter_params = _build_filter_where(args)
 
@@ -329,14 +343,26 @@ def list_pqs():
                 params + [limit, offset],
             ).fetchall()
 
-        tags_map = _tags_for(c, [r["pq_ref"] for r in page_rows])
+        # In compact mode we don't need tags either — skip the extra query.
+        tags_map = _tags_for(c, [r["pq_ref"] for r in page_rows]) if not compact else {}
         items: list[dict] = []
+        _compact_drop = ("tags", "minister", "department", "permalink")
         for r in page_rows:
             if q:
                 snip = _pick_snippet(r["snip_q"], r["snip_a"])
+                if compact and snip:
+                    snip = _snippet(snip, max_chars=snippet_cap)
             else:
-                snip = _snippet(r["question_text"])
-            items.append(_row_to_summary(r, tags_map, snippet_text=snip))
+                snip = _snippet(r["question_text"], max_chars=snippet_cap)
+            item = _row_to_summary(r, tags_map, snippet_text=snip)
+            if compact:
+                for key in _compact_drop:
+                    item.pop(key, None)
+            if fields is not None:
+                # Whitelist — always keep pq_ref so callers can re-fetch.
+                keep = fields | {"pq_ref"}
+                item = {k: v for k, v in item.items() if k in keep}
+            items.append(item)
 
         return jsonify({
             "total": total,
@@ -469,24 +495,39 @@ _AGG_GROUPS = {
 @api.route("/aggregate", methods=["GET"])
 @auth_required
 def aggregate():
-    """Count PQs grouped by a single dimension, optionally filtered.
+    """Count PQs grouped by one or two dimensions, optionally filtered.
 
-    group_by ∈ {constituency, member, party, minister, department, status,
-                month, year, tag}
+    group_by    ∈ {constituency, member, party, minister, department, status,
+                   month, year, tag}     (required)
+    group_by_2  ∈ same set, optional. When set, returns a 2D matrix of
+                   buckets {key, key_2, count} — i.e. a heatmap-shaped result.
+                   Counts are DISTINCT pq_ref per (key, key_2) cell, so
+                   sum(counts) ≥ total_pqs only when 'tag' is on one axis.
 
     Accepts the same filters as /pqs. Returns `buckets` sorted by count DESC.
 
-    For group_by=tag, sum(counts) > total_pqs is normal — a PQ can carry
-    multiple tags. For every other dimension each PQ contributes to exactly
-    one bucket.
+    For group_by=tag (or group_by_2=tag), sum(counts) > total_pqs is normal —
+    a PQ can carry multiple tags. For every other dimension each PQ
+    contributes to exactly one bucket per axis.
+
+    group_by_2 cannot equal group_by, and 'tag' on both axes is not allowed.
     """
     args = request.args
     group_by = (args.get("group_by") or "").strip()
+    group_by_2 = (args.get("group_by_2") or "").strip() or None
     allowed = list(_AGG_GROUPS.keys()) + ["tag"]
     if not group_by:
         return jsonify({"error": "group_by required", "allowed": allowed, "code": 400}), 400
     if group_by not in allowed:
         return jsonify({"error": f"invalid group_by: {group_by}", "allowed": allowed, "code": 400}), 400
+    if group_by_2 is not None:
+        if group_by_2 not in allowed:
+            return jsonify({"error": f"invalid group_by_2: {group_by_2}", "allowed": allowed, "code": 400}), 400
+        if group_by_2 == group_by:
+            return jsonify({"error": "group_by_2 must differ from group_by", "code": 400}), 400
+        if group_by == "tag" and group_by_2 == "tag":
+            # Already caught by the != check, but be explicit.
+            return jsonify({"error": "tag cannot be on both axes", "code": 400}), 400
 
     try:
         limit = int(args.get("limit") or 200)
@@ -526,33 +567,78 @@ def aggregate():
             f"SELECT COUNT(*) FROM ({inner_sql})", inner_params
         ).fetchone()[0]
 
-        if group_by == "tag":
-            rows = c.execute(
-                f"""SELECT pt.tag AS key, COUNT(DISTINCT pt.pq_ref) AS count
-                      FROM pq_tags pt
-                     WHERE pt.pq_ref IN ({inner_sql})
-                     GROUP BY pt.tag
-                     ORDER BY count DESC, pt.tag
-                     LIMIT ?""",
-                inner_params + [limit],
-            ).fetchall()
-        else:
-            col_expr = _AGG_GROUPS[group_by]
-            rows = c.execute(
-                f"""SELECT {col_expr} AS key, COUNT(*) AS count
-                      FROM questions q
-                     WHERE q.pq_ref IN ({inner_sql})
-                       AND {col_expr} IS NOT NULL
-                     GROUP BY key
-                     ORDER BY count DESC, key
-                     LIMIT ?""",
-                inner_params + [limit],
-            ).fetchall()
+        if group_by_2 is None:
+            # ----- single axis -------------------------------------------
+            if group_by == "tag":
+                rows = c.execute(
+                    f"""SELECT pt.tag AS key, COUNT(DISTINCT pt.pq_ref) AS count
+                          FROM pq_tags pt
+                         WHERE pt.pq_ref IN ({inner_sql})
+                         GROUP BY pt.tag
+                         ORDER BY count DESC, pt.tag
+                         LIMIT ?""",
+                    inner_params + [limit],
+                ).fetchall()
+            else:
+                col_expr = _AGG_GROUPS[group_by]
+                rows = c.execute(
+                    f"""SELECT {col_expr} AS key, COUNT(*) AS count
+                          FROM questions q
+                         WHERE q.pq_ref IN ({inner_sql})
+                           AND {col_expr} IS NOT NULL
+                         GROUP BY key
+                         ORDER BY count DESC, key
+                         LIMIT ?""",
+                    inner_params + [limit],
+                ).fetchall()
+
+            return jsonify({
+                "group_by": group_by,
+                "total_pqs": total_pqs,
+                "buckets": [{"key": r["key"], "count": r["count"]} for r in rows],
+            })
+
+        # ----- dual axis (matrix) ----------------------------------------
+        # Build a flat JOIN chain off a `base` set of filtered pq_refs.
+        # COUNT(DISTINCT base.pq_ref) collapses the multiplication a tag
+        # join introduces, so a PQ with two tags counts once per (key, key_2)
+        # cell even when one axis is 'tag'.
+        joins: list[str] = []
+        joined_questions = False
+        projections: dict[str, str] = {}
+        for axis_alias, axis_name in (("key", group_by), ("key_2", group_by_2)):
+            if axis_name == "tag":
+                pt = f"pt_{axis_alias}"
+                joins.append(f"JOIN pq_tags AS {pt} ON {pt}.pq_ref = base.pq_ref")
+                projections[axis_alias] = f"{pt}.tag"
+            else:
+                if not joined_questions:
+                    joins.append("JOIN questions AS q_g ON q_g.pq_ref = base.pq_ref")
+                    joined_questions = True
+                projections[axis_alias] = _AGG_GROUPS[axis_name].replace("q.", "q_g.")
+
+        select_parts = [f"{expr} AS {alias}" for alias, expr in projections.items()]
+        non_null = " AND ".join(f"{expr} IS NOT NULL" for expr in projections.values())
+
+        sql = (
+            f"SELECT {', '.join(select_parts)}, COUNT(DISTINCT base.pq_ref) AS count "
+            f"FROM ({inner_sql}) AS base "
+            f"{' '.join(joins)} "
+            f"WHERE {non_null} "
+            "GROUP BY key, key_2 "
+            "ORDER BY count DESC, key, key_2 "
+            "LIMIT ?"
+        )
+        rows = c.execute(sql, inner_params + [limit]).fetchall()
 
         return jsonify({
             "group_by": group_by,
+            "group_by_2": group_by_2,
             "total_pqs": total_pqs,
-            "buckets": [{"key": r["key"], "count": r["count"]} for r in rows],
+            "buckets": [
+                {"key": r["key"], "key_2": r["key_2"], "count": r["count"]}
+                for r in rows
+            ],
         })
     finally:
         c.close()

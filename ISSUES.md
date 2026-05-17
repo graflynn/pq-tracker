@@ -61,6 +61,11 @@ Add new entries at the **top** so the most recent is first.
   in place, a per-project memory file pointing at the project's
   `ISSUES.md` would be a belt-and-braces alternative to the skill
   edit.
+- **Resolved (skill side): 2026-05-17** (commit pending in this session).
+  Added a "Before significant work, read the issues log" section near
+  the top of `pq-plugin/skills/pq-research/SKILL.md` with the absolute
+  path to this file and the two user shortcuts. Cowork-side memory
+  wiring remains open as a "secondary" upstream ask.
 
 ## 2026-05-17 — Agent stuck on artifact route instead of pivoting to Python
 
@@ -91,6 +96,12 @@ Add new entries at the **top** so the most recent is first.
   > re-openable live view. Don't default to artifacts when a static
   > image will do — they have more failure modes (bridge timing,
   > response-shape quirks, CDN restrictions).
+- **Resolved: 2026-05-17** (commit pending). Added a "Choosing the
+  output format" section to `pq-research/SKILL.md` listing static
+  matplotlib PNG as the default for charts, xlsx/docx/pptx for richer
+  deliverables, and artifacts only when interactivity is explicitly
+  asked for. Includes a "if you're debugging the artifact bridge,
+  you've overshot" rule of thumb.
 
 ## 2026-05-17 — Artifact: `callMcpTool` response shape is undocumented (unresolved)
 
@@ -150,6 +161,13 @@ Add new entries at the **top** so the most recent is first.
   `pq_aggregate` per-row for symmetric matrices, `pq_list` +
   client-side grouping for ragged matrices, **matplotlib/seaborn from
   the sandbox for the actual rendering**.
+- **Resolved: 2026-05-17** (commit pending). Added a "Heatmap / 2D
+  matrix" recipe to the "Common report shapes" section in
+  `pq-research/SKILL.md` covering the four mandatory clarifications,
+  the canonical `pq_aggregate group_by + group_by_2` route, the
+  ragged-matrix fallback via `pq_list compact=True fields=[...]`, and
+  matplotlib `imshow` / seaborn `heatmap` as the render targets. Tied
+  in with the new `group_by_2` plugin support (see entry below).
 
 ## 2026-05-17 — `pq_aggregate` has no second axis, encouraging `pq_sql` reach
 
@@ -171,6 +189,14 @@ Add new entries at the **top** so the most recent is first.
   - **Skill:** Until then, add an explicit "ragged matrix" recipe noting
     `pq_list` + client-side grouping is preferred over `pq_sql` for this
     shape.
+- **Resolved: 2026-05-17** (commit pending). Plugin: `pq_aggregate` now
+  accepts `group_by_2` (named that way for symmetry with `group_by`, not
+  `secondary_group_by`). Both axes accept any of constituency / member /
+  party / minister / department / status / month / year / tag, with
+  guards that they differ and that 'tag' isn't on both axes
+  simultaneously. Counts use `COUNT(DISTINCT pq_ref)` so tag joins
+  don't double-count. Skill: heatmap recipe + ragged-matrix fallback
+  added to `pq-research/SKILL.md` "Common report shapes".
 
 ## 2026-05-17 — `pq_list` with `limit=200` exceeds the agent's tool-output cap
 
@@ -193,6 +219,16 @@ Add new entries at the **top** so the most recent is first.
     `minister`, `department` from the rows.
   - Either way, tighten the snippet hard-cap (~120 chars) and document it
     in the tool docstring.
+- **Resolved: 2026-05-17** (commit pending). Plugin: `pq_list` now
+  accepts BOTH `compact=True` (drops tags / minister / department /
+  permalink and tightens snippet to ~120 chars) and `fields=[...]` (a
+  whitelist; pq_ref is always returned). Skipping the tags lookup in
+  compact mode also avoids the extra `pq_tags` query. Tool docstring
+  in `mcp_server.py` documents the payload-size guidance plus when to
+  reach for each knob. The CGM-by-constituency case that triggered
+  this entry now fits comfortably in context with
+  `pq_list(tag=["cgm"], limit=200, compact=True)` or
+  `fields=["pq_ref","constituency","member"]`.
 
 ## 2026-05-17 — Flask API `start-server.cmd` is an undocumented prerequisite
 
@@ -216,6 +252,15 @@ Add new entries at the **top** so the most recent is first.
   - At minimum, return a **helpful, actionable** error from any tool
     call when the API is unreachable: *"pq-tracker Flask API not
     running. Launch `start-server.cmd` in the repo root and retry."*
+- **Partial: 2026-05-17** (commit `b699353`). The "at minimum" bullet
+  shipped — `_server_down_message()` in `pq_tracker/mcp_server.py`
+  catches `ConnectionError` / `Timeout` from `_get` and `_post` and
+  raises a `RuntimeError` naming the "PQ Server!" desktop shortcut and
+  the launcher path. The agent surfaces this verbatim. Still open: the
+  bigger architectural change of having the MCP launcher spawn Flask
+  itself, or merging the two processes — that's a design call Grainne
+  has deferred while the UI/agent split is useful (two separate consoles,
+  the UI keeps running across agent sessions, etc.).
 
 ## 2026-05-17 — `run-mcp.cmd` lands in a directory without `.venv` or `pq_tracker`
 

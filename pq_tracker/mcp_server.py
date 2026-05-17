@@ -104,6 +104,8 @@ def pq_list(
     date_answered_to: str = "",
     limit: int = 50,
     offset: int = 0,
+    compact: bool = False,
+    fields: list[str] | None = None,
 ) -> dict:
     """List/filter parliamentary questions with pagination.
 
@@ -115,6 +117,13 @@ def pq_list(
 
     Returns compact rows (snippet, not full text). For the full question +
     answer body, follow up with pq_get on the pq_ref.
+
+    PAYLOAD-SIZE TIP. The default row carries ~12 fields per PQ; with
+    limit=100+ that can blow past the agent's tool-output cap (see ISSUES.md).
+    Use `compact=True` to drop tags/minister/department/permalink and halve
+    the snippet, or `fields=[...]` to whitelist exactly the columns you need
+    for downstream grouping. pq_ref is always returned. Prefer `fields=` over
+    `pq_sql` when you just need a few columns for client-side aggregation.
 
     Args:
         q: FTS5 search; phrases ("mental health") and prefix * ("diab*") work.
@@ -129,6 +138,10 @@ def pq_list(
         date_answered_from / date_answered_to: bounds on date_answered.
         limit: 1..500, default 50.
         offset: pagination offset.
+        compact: drop tags/minister/department/permalink; snippet ~120 chars.
+        fields: whitelist response keys (pq_ref always kept).
+            Examples: ["pq_ref", "constituency", "member"] for grouping;
+            ["pq_ref", "date_asked", "snippet"] for a timeline scan.
     """
     return _get(
         "/pqs",
@@ -148,6 +161,8 @@ def pq_list(
         },
         limit=limit,
         offset=offset,
+        compact="true" if compact else "",
+        fields=",".join(fields) if fields else "",
     )
 
 
@@ -170,6 +185,7 @@ def pq_get(pq_ref: str, include: str = "question,answer,tags,hse_pdfs") -> dict:
 @mcp.tool()
 def pq_aggregate(
     group_by: str,
+    group_by_2: str = "",
     q: str = "",
     constituency: list[str] | None = None,
     member: list[str] | None = None,
@@ -182,15 +198,21 @@ def pq_aggregate(
     date_to: str = "",
     limit: int = 200,
 ) -> dict:
-    """Count PQs grouped along one dimension. The workhorse for reports
-    and trends.
+    """Count PQs grouped along one OR two dimensions. The workhorse for
+    reports, trends, and heatmaps.
 
-    group_by ∈ {constituency, member, party, minister, department, status,
-                month, year, tag}.
+    group_by    ∈ {constituency, member, party, minister, department, status,
+                   month, year, tag}.
+    group_by_2  optional second axis from the same set. When set, buckets
+                have shape {key, key_2, count} — i.e. a 2D matrix suitable
+                for a heatmap. Cannot equal group_by. 'tag' cannot be on
+                both axes simultaneously.
 
     Buckets: month → "YYYY-MM"; year → "YYYY".
-    For group_by="tag", a PQ with N tags contributes to N buckets — so
-    sum(counts) > total_pqs. For every other dimension each PQ counts once.
+    For group_by="tag" (or group_by_2="tag"), a PQ with N tags contributes
+    to N cells along that axis — sum(counts) > total_pqs when 'tag' is in
+    play. For every other dimension each PQ contributes to exactly one
+    bucket per axis.
 
     All filters honored — combine to slice before counting.
 
@@ -201,10 +223,15 @@ def pq_aggregate(
             group_by="member", tag=["type 1"]
         Pending vs answered split for 2025:
             group_by="status", date_from="2025-01-01"
+        Heatmap of CGM PQs by constituency × year:
+            group_by="constituency", group_by_2="year", tag=["cgm"]
+        Constituency × topic matrix:
+            group_by="constituency", group_by_2="tag"
     """
     return _get(
         "/aggregate",
         group_by=group_by,
+        group_by_2=group_by_2,
         q=q,
         constituency=constituency,
         member=member,
