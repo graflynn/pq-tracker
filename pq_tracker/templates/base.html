@@ -159,6 +159,20 @@
   .chip-tag .x { margin-left: 5px; cursor: pointer; opacity: 0.6; }
   .chip-tag .x:hover { opacity: 1; }
 
+  /* Topics & tags column: prefer wrapping chips onto a second line over
+     widening the column. Narrow target so 2-line wrap is the common case
+     and the Question column can claim the freed width. */
+  td.cell-chips { white-space: normal; line-height: 1.55; }
+  .col-topics_tags { width: 130px; max-width: 130px; }
+  td.cell-chips .chip { margin-bottom: 2px; }
+
+  /* Status column: compact check-icon for answered, dash for pending. */
+  .col-answer_status { width: 1%; text-align: center; }
+  td.col-answer_status { white-space: nowrap; }
+  .status-icon { font-size: 14px; line-height: 1; display: inline-block; }
+  .status-icon.answered { color: var(--answered); font-weight: 700; }
+  .status-icon.pending  { color: var(--muted); }
+
   /* "Group related" toggle in the action bar. */
   .group-toggle { display: inline-flex; align-items: center; gap: 5px;
                   font-size: 13px; color: var(--fg); cursor: pointer;

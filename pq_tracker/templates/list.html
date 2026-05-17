@@ -196,7 +196,13 @@
         {% for t in r.matched_topics_list %}<span class="chip">{{ t }}</span>{% endfor %}
         {% for t in r.tags %}<span class="chip chip-tag">{{ t }}</span>{% endfor %}
       </td>
-      <td class="col col-answer_status" data-col="answer_status"><span class="status-{{ r.answer_status }}">{{ r.answer_status }}</span></td>
+      <td class="col col-answer_status" data-col="answer_status" title="{{ r.answer_status }}">
+        {% if r.answer_status == 'answered' %}
+          <span class="status-icon answered" aria-label="answered">&check;</span>
+        {% else %}
+          <span class="status-icon pending" aria-label="pending">&mdash;</span>
+        {% endif %}
+      </td>
       <td class="col col-date_answered" data-col="date_answered">{{ r.date_answered or '' }}</td>
       <td class="col col-question_text" data-col="question_text">
         <div class="q-cell">
