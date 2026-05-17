@@ -104,6 +104,14 @@ def _poll_pending(client: OireachtasClient, conn) -> tuple[int, int]:
             )
             # Mirror into FTS5 (inline-content: no auto-sync from the base table).
             db.refresh_fts_for_pq(conn, row["pq_ref"], final_q, qa.answer_text)
+            # Re-derive auto tags now that question_text may have changed.
+            # apply_auto_tags preserves user overrides.
+            settings_now = cfg.load_config()
+            new_auto = match_keyword_tags(
+                f"{row['raw_question_showas']}\n{final_q}",
+                settings_now.keywords,
+            )
+            db.apply_auto_tags(conn, row["pq_ref"], new_auto)
             # Embed the answer that just landed (and re-embed the question if
             # text changed). embed_pq skips sources whose chunk count matches.
             try:
@@ -222,13 +230,15 @@ def run(lookback_days: int | None = None, start_date: date | None = None,
                         question_text=final_q,
                         answer_text=qa.answer_text,
                         answer_status=answer_status,
-                        matched_topics=tag_hits,
                         oireachtas_permalink=_permalink(entry),
                         xml_url=entry.xml_url or "",
                         pdf_url=entry.pdf_url,
                         raw_question_showas=entry.show_as,
                         xml_raw=qa.xml_raw,
                     )
+                    # Apply auto tags + refresh matched_topics, preserving any
+                    # user_added / user_suppressed overrides from prior runs.
+                    db.apply_auto_tags(conn, entry.pq_ref, tag_hits)
                     if result["inserted"]:
                         new_count += 1
                     if result["newly_answered"] or (result["inserted"] and answer_status == "answered"):

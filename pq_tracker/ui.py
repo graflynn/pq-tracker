@@ -501,7 +501,7 @@ def list_view():
         total_in_db = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     with _conn() as conn2:
-        tags_map = db.tags_by_pqref(conn2)
+        pq_tags_map = db.pq_tags_by_pqref(conn2)
         hse_pdf_map: dict[str, int] = {}
         for r2 in conn2.execute(
             """SELECT j.pq_ref, MIN(p.id) AS pdf_id
@@ -512,7 +512,7 @@ def list_view():
         ):
             hse_pdf_map[r2["pq_ref"]] = r2["pdf_id"]
     def _enrich(d: dict) -> dict:
-        d["tags"] = tags_map.get(d["pq_ref"], [])
+        d["pq_tags"] = pq_tags_map.get(d["pq_ref"], [])
         d["hse_pdf_id"] = hse_pdf_map.get(d["pq_ref"])
         return d
 
@@ -561,15 +561,20 @@ def detail_view(pq_ref: str):
 @app.route("/pq/<path:pq_ref>/save", methods=["POST"])
 def save(pq_ref: str):
     """Classic form POST from the detail page. Redirects back on success."""
+    from .matching import match_keyword_tags
     constituent = (request.form.get("constituent") or "").strip() or None
     notes = (request.form.get("notes") or "").strip() or None
     hse_pdf_url = (request.form.get("hse_pdf_url") or "").strip() or None
     tags_csv = (request.form.get("tags") or "").strip()
     tags = [t.strip() for t in tags_csv.split(",")] if tags_csv else []
+    keywords = cfg.load_config().keywords
     with _conn() as conn:
         if not db.update_manual_fields(conn, pq_ref, constituent, notes, hse_pdf_url):
             abort(404)
-        db.set_tags(conn, pq_ref, tags)
+        row = db.get_question(conn, pq_ref)
+        text = "\n".join(filter(None, [row["raw_question_showas"], row["question_text"]]))
+        auto = match_keyword_tags(text, keywords)
+        db.set_desired_tags(conn, pq_ref, tags, auto)
         conn.commit()
     return redirect(url_for("detail_view", pq_ref=pq_ref))
 
@@ -666,10 +671,9 @@ def export_xlsx():
                 f"SELECT * FROM questions{where} ORDER BY date_asked DESC, pq_ref",
                 params,
             ).fetchall()
-        tags_map = db.tags_by_pqref(conn)
         answers_map = db.answers_by_pqref(conn)
     buf = io.BytesIO()
-    exports.write_xlsx(rows, buf, tags_map=tags_map, answers_map=answers_map)
+    exports.write_xlsx(rows, buf, answers_map=answers_map)
     buf.seek(0)
     filtered = any(v for k, v in f.items())
     suffix = "filtered" if filtered else "all"
@@ -832,12 +836,14 @@ def api_ingest_status():
 
 @app.route("/api/topics/rebuild", methods=["POST"])
 def api_topics_rebuild():
-    """Recompute matched_topics for every PQ against the current topics.yaml.
+    """Recompute auto tags for every PQ against the current topics.yaml.
 
-    Pure local rescan — no Oireachtas network calls. Updates rows where the
-    auto-tag set has changed (including clearing rows that no longer match any
-    current keyword, so vestiges of removed keywords go away). Runs in a single
-    transaction; expected to take a second or two even for the full 5k+ corpus.
+    Pure local rescan — no Oireachtas network calls. Preserves user overrides:
+    a tag the user explicitly removed (user_suppressed) stays suppressed; a
+    tag the user added (user_added) stays added. Runs in a single transaction;
+    a few seconds for the 2k-row corpus.
+
+    Returns counts of PQs whose display tag set changed plus per-state totals.
     """
     from .matching import match_keyword_tags
     keywords = cfg.load_config().keywords
@@ -850,21 +856,17 @@ def api_topics_rebuild():
         ).fetchall()
         for r in rows:
             scanned += 1
-            text = r["raw_question_showas"] or r["question_text"] or ""
+            text = "\n".join(filter(None, [r["raw_question_showas"], r["question_text"]]))
             hits = match_keyword_tags(text, keywords)
             try:
-                current = json.loads(r["matched_topics"] or "[]")
+                prior_display = set(json.loads(r["matched_topics"] or "[]"))
             except json.JSONDecodeError:
-                current = []
-            if set(hits) == set(current):
-                continue
-            conn.execute(
-                "UPDATE questions SET matched_topics = ? WHERE pq_ref = ?",
-                (json.dumps(hits), r["pq_ref"]),
-            )
-            updated += 1
-            if not hits:
-                cleared += 1
+                prior_display = set()
+            new_display = db.apply_auto_tags(conn, r["pq_ref"], hits)
+            if set(new_display) != prior_display:
+                updated += 1
+                if not new_display:
+                    cleared += 1
         conn.commit()
     return jsonify({
         "ok": True,
@@ -917,6 +919,8 @@ def api_save(pq_ref: str):
     if not isinstance(tags, list):
         tags = []
 
+    from .matching import match_keyword_tags
+    keywords = cfg.load_config().keywords
     last_err: Exception | None = None
     for attempt in range(20):
         try:
@@ -928,7 +932,10 @@ def api_save(pq_ref: str):
                     hse_pdf_url = existing["hse_pdf_url"]
                 if not db.update_manual_fields(conn, pq_ref, constituent, notes, hse_pdf_url):
                     abort(404)
-                db.set_tags(conn, pq_ref, tags)
+                row = db.get_question(conn, pq_ref)
+                text = "\n".join(filter(None, [row["raw_question_showas"], row["question_text"]]))
+                auto = match_keyword_tags(text, keywords)
+                db.set_desired_tags(conn, pq_ref, tags, auto)
                 conn.commit()
                 row = db.get_question(conn, pq_ref)
                 d = _row_to_dict(row, conn)
@@ -1031,7 +1038,11 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
     d["group_in_corpus_size"] = 1
     d["group_members"] = []
     if conn is not None:
-        d["tags"] = db.get_tags(conn, d["pq_ref"])
+        # Unified tag set: (auto + user_added) with per-tag state so the
+        # template can colour chips (auto → blue, user_added → yellow).
+        pq_tag_rows = db.get_pq_tags(conn, d["pq_ref"])
+        d["pq_tags"] = pq_tag_rows
+        d["tags"] = [r["tag"] for r in pq_tag_rows]  # back-compat for list rendering
         d["hse_pdfs"] = db.get_hse_pdfs_for_pq(conn, d["pq_ref"])
         if with_shared:
             group = db.get_group_siblings(conn, d["pq_ref"])
@@ -1041,6 +1052,7 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
             d["shared_with"] = []
             d["shared_total"] = 0
     else:
+        d["pq_tags"] = []
         d["tags"] = []
         d["hse_pdfs"] = []
         d["shared_with"] = []

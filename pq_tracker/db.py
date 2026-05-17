@@ -64,13 +64,28 @@ CREATE TABLE IF NOT EXISTS members_cache (
   fetched_at          TIMESTAMP NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS tags (
+-- Tags per PQ, with three states. Replaces the old `tags` table (which was
+-- user-added-only) AND the auto-derived list previously living only in
+-- `questions.matched_topics`. The denormalized `matched_topics` JSON is still
+-- maintained on `questions` as a fast display cache — the source of truth is
+-- this table. State semantics:
+--   auto              rule in topics.yaml matched this PQ; included in display
+--   user_added        user-added in the modal; included in display, persists
+--                     across topics.yaml edits and rebuilds
+--   user_suppressed   user removed an auto tag; the rule may still match but
+--                     we don't re-add it on rebuild. NOT shown in display.
+-- Modal flow: backend takes the desired display list, classifies each entry
+-- as auto (if rule matches) or user_added (if not), and stores
+-- (auto-rule-matches - desired) as user_suppressed.
+CREATE TABLE IF NOT EXISTS pq_tags (
   pq_ref TEXT NOT NULL,
   tag    TEXT NOT NULL,
+  state  TEXT NOT NULL CHECK (state IN ('auto','user_added','user_suppressed')),
   PRIMARY KEY (pq_ref, tag),
   FOREIGN KEY (pq_ref) REFERENCES questions(pq_ref) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS ix_tags_tag ON tags(tag);
+CREATE INDEX IF NOT EXISTS ix_pq_tags_tag   ON pq_tags(tag);
+CREATE INDEX IF NOT EXISTS ix_pq_tags_state ON pq_tags(state);
 
 CREATE TABLE IF NOT EXISTS run_log (
   run_id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,6 +365,38 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # SQLite 3.35+ supports DROP COLUMN; once dropped, the check above no-ops.
     if "answer_text" in cols:
         conn.execute("ALTER TABLE questions DROP COLUMN answer_text")
+    # Tags model migration: collapse the old `tags` table (user-added only) and
+    # the auto-derived list-on-`matched_topics` into a single `pq_tags` table
+    # with explicit state. Old `tags` rows become state='user_added'; existing
+    # `matched_topics` JSON becomes state='auto' (one row per element).
+    # Idempotent — `tags` only exists pre-migration; the auto-backfill skips
+    # rows that already have any pq_tags entries.
+    has_old_tags = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tags'"
+    ).fetchone() is not None
+    if has_old_tags:
+        conn.execute(
+            """INSERT OR IGNORE INTO pq_tags(pq_ref, tag, state)
+               SELECT pq_ref, tag, 'user_added' FROM tags"""
+        )
+        conn.execute("DROP TABLE tags")
+    # Auto-state backfill from existing matched_topics JSON. Only touch PQs
+    # that have no pq_tags rows yet — second runs are no-ops.
+    has_any = conn.execute("SELECT 1 FROM pq_tags LIMIT 1").fetchone()
+    if not has_any:
+        for r in conn.execute(
+            "SELECT pq_ref, matched_topics FROM questions WHERE matched_topics IS NOT NULL"
+        ).fetchall():
+            try:
+                topics = json.loads(r["matched_topics"] or "[]")
+            except json.JSONDecodeError:
+                continue
+            if not topics:
+                continue
+            conn.executemany(
+                "INSERT OR IGNORE INTO pq_tags(pq_ref, tag, state) VALUES (?, ?, 'auto')",
+                [(r["pq_ref"], t) for t in topics if t],
+            )
     conn.commit()
 
 
@@ -450,13 +497,18 @@ def upsert_question(conn: sqlite3.Connection, *,
                     question_text: str,
                     answer_text: str | None,
                     answer_status: str,
-                    matched_topics: list[str],
                     oireachtas_permalink: str,
                     xml_url: str,
                     pdf_url: str | None,
                     raw_question_showas: str,
                     xml_raw: bytes | None = None) -> dict:
-    """Returns {'inserted': bool, 'newly_answered': bool}."""
+    """Returns {'inserted': bool, 'newly_answered': bool}.
+
+    ``matched_topics`` is no longer a param — the source of truth is the
+    ``pq_tags`` table. Callers must call ``apply_auto_tags`` after this to
+    persist freshly-computed auto labels and refresh the matched_topics cache.
+    On INSERT, matched_topics is initialised to '[]'; UPDATE leaves it alone.
+    """
     now = datetime.utcnow().isoformat(timespec="seconds")
     answer_id = upsert_answer(conn, answer_text)
     existing = conn.execute(
@@ -474,7 +526,7 @@ def upsert_question(conn: sqlite3.Connection, *,
               xml_url, pdf_url, hse_pdf_url, constituent, notes,
               source, raw_question_showas, xml_raw,
               first_seen_at, last_updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'[]',?,?,?,NULL,NULL,NULL,'oireachtas',?,?,?,?)
             """,
             (
                 pq_ref, question_uri,
@@ -483,7 +535,6 @@ def upsert_question(conn: sqlite3.Connection, *,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
                 question_text, answer_id, answer_status,
-                json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink,
                 xml_url, pdf_url,
                 raw_question_showas, xml_raw,
@@ -492,7 +543,8 @@ def upsert_question(conn: sqlite3.Connection, *,
         )
         refresh_fts_for_pq(conn, pq_ref, question_text, answer_text)
         return {"inserted": True, "newly_answered": answer_status == "answered"}
-    # Update existing row. Preserve hse_pdf_url (manual attachment) and first_seen_at.
+    # Update existing row. Preserve hse_pdf_url (manual attachment), first_seen_at,
+    # and matched_topics (managed by apply_auto_tags).
     was_pending = existing["answer_status"] == "pending"
     # xml_raw: preserve existing when caller didn't pass new bytes (e.g. a
     # pending→pending re-scan with no XML refetch). Overwrite when caller did.
@@ -512,7 +564,6 @@ def upsert_question(conn: sqlite3.Connection, *,
               question_text = ?,
               answer_id = ?,
               answer_status = ?,
-              matched_topics = ?,
               oireachtas_permalink = ?,
               xml_url = ?,
               pdf_url = ?,
@@ -528,7 +579,6 @@ def upsert_question(conn: sqlite3.Connection, *,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
                 question_text, answer_id, answer_status,
-                json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas, xml_raw,
                 now, pq_ref,
@@ -550,7 +600,6 @@ def upsert_question(conn: sqlite3.Connection, *,
               question_text = ?,
               answer_id = ?,
               answer_status = ?,
-              matched_topics = ?,
               oireachtas_permalink = ?,
               xml_url = ?,
               pdf_url = ?,
@@ -565,7 +614,6 @@ def upsert_question(conn: sqlite3.Connection, *,
                 td_name, td_member_code, td_party, td_constituency,
                 department, minister_name,
                 question_text, answer_id, answer_status,
-                json.dumps(matched_topics, ensure_ascii=False),
                 oireachtas_permalink, xml_url, pdf_url,
                 raw_question_showas,
                 now, pq_ref,
@@ -746,17 +794,25 @@ def get_group_siblings(conn: sqlite3.Connection, pq_ref: str) -> dict:
     return {"siblings": out, "total": len(eids)}
 
 
-def get_tags(conn: sqlite3.Connection, pq_ref: str) -> list[str]:
+def get_pq_tags(conn: sqlite3.Connection, pq_ref: str) -> list[dict]:
+    """Display set for a PQ: (auto + user_added) rows from pq_tags.
+
+    Returns ``[{tag, state}, ...]`` so the modal can render per-chip styling.
+    user_suppressed rows are excluded — they only matter to the rebuild path.
+    """
     rows = conn.execute(
-        "SELECT tag FROM tags WHERE pq_ref = ? ORDER BY tag", (pq_ref,)
+        """SELECT tag, state FROM pq_tags
+            WHERE pq_ref = ? AND state IN ('auto', 'user_added')
+            ORDER BY LOWER(tag)""",
+        (pq_ref,),
     ).fetchall()
-    return [r[0] for r in rows]
+    return [{"tag": r["tag"], "state": r["state"]} for r in rows]
 
 
-def set_tags(conn: sqlite3.Connection, pq_ref: str, tags: list[str]) -> None:
-    """Replace the full tag set for a PQ. Tags are trimmed + deduplicated, case preserved."""
+def _normalize_tag_list(tags: list[str]) -> list[str]:
+    """Strip, drop empty, dedup case-insensitively preserving first-seen case."""
     seen: set[str] = set()
-    clean: list[str] = []
+    out: list[str] = []
     for t in tags or []:
         s = (t or "").strip()
         if not s:
@@ -765,63 +821,213 @@ def set_tags(conn: sqlite3.Connection, pq_ref: str, tags: list[str]) -> None:
         if key in seen:
             continue
         seen.add(key)
-        clean.append(s)
-    conn.execute("DELETE FROM tags WHERE pq_ref = ?", (pq_ref,))
-    if clean:
+        out.append(s)
+    return out
+
+
+def _refresh_matched_topics(conn: sqlite3.Connection, pq_ref: str) -> list[str]:
+    """Recompute ``questions.matched_topics`` JSON from current pq_tags rows.
+    Returns the new display list."""
+    rows = conn.execute(
+        """SELECT tag FROM pq_tags
+            WHERE pq_ref = ? AND state IN ('auto', 'user_added')
+            ORDER BY LOWER(tag)""",
+        (pq_ref,),
+    ).fetchall()
+    display = [r["tag"] for r in rows]
+    conn.execute(
+        "UPDATE questions SET matched_topics = ? WHERE pq_ref = ?",
+        (json.dumps(display, ensure_ascii=False), pq_ref),
+    )
+    return display
+
+
+def set_desired_tags(conn: sqlite3.Connection, pq_ref: str,
+                     desired: list[str], auto_labels: list[str]) -> list[dict]:
+    """Persist the user's desired display set for one PQ.
+
+    Each desired tag becomes:
+      - state='auto'        if it matches an entry in ``auto_labels`` (i.e.
+                              the current keyword rule would derive it for
+                              this PQ's text)
+      - state='user_added'  otherwise
+
+    Auto labels NOT in ``desired`` become state='user_suppressed' — that's the
+    user's intent that the rebuild must respect.
+
+    Wipes existing pq_tags rows for this PQ and reinserts. Refreshes the
+    denormalized ``questions.matched_topics`` cache. Returns the resulting
+    display rows.
+    """
+    desired_clean = _normalize_tag_list(desired)
+    auto_clean = _normalize_tag_list(auto_labels)
+
+    # Build a case-insensitive index of auto_labels for membership checks
+    # while preserving the desired tag's case in storage.
+    auto_lc = {a.lower(): a for a in auto_clean}
+    desired_lc = {t.lower() for t in desired_clean}
+
+    new_rows: list[tuple[str, str]] = []
+    for t in desired_clean:
+        if t.lower() in auto_lc:
+            new_rows.append((t, "auto"))
+        else:
+            new_rows.append((t, "user_added"))
+    for a in auto_clean:
+        if a.lower() not in desired_lc:
+            new_rows.append((a, "user_suppressed"))
+
+    conn.execute("DELETE FROM pq_tags WHERE pq_ref = ?", (pq_ref,))
+    if new_rows:
         conn.executemany(
-            "INSERT INTO tags(pq_ref, tag) VALUES (?, ?)",
-            [(pq_ref, t) for t in clean],
+            "INSERT INTO pq_tags(pq_ref, tag, state) VALUES (?, ?, ?)",
+            [(pq_ref, t, s) for (t, s) in new_rows],
         )
+    _refresh_matched_topics(conn, pq_ref)
+    return [{"tag": t, "state": s} for (t, s) in new_rows if s != "user_suppressed"]
+
+
+def apply_auto_tags(conn: sqlite3.Connection, pq_ref: str,
+                    new_auto: list[str]) -> list[str]:
+    """Apply a freshly-derived auto-label set to one PQ while preserving user
+    overrides. Used by ingest (after upsert) and by the topics-rebuild loop.
+
+    Behaviour:
+      - For each tag in ``new_auto``: if a user_suppressed row exists, leave it
+        suppressed; otherwise ensure an 'auto' row exists.
+      - Existing 'auto' rows whose tag is NOT in ``new_auto`` are dropped
+        (the rule no longer matches; nothing else to anchor them).
+      - 'user_added' and 'user_suppressed' rows are never touched.
+
+    Refreshes matched_topics. Returns the new display list.
+    """
+    new_auto_clean = _normalize_tag_list(new_auto)
+    existing = {
+        r["tag"]: r["state"]
+        for r in conn.execute(
+            "SELECT tag, state FROM pq_tags WHERE pq_ref = ?", (pq_ref,)
+        )
+    }
+    target: dict[str, str] = {}
+    for t in new_auto_clean:
+        prior = existing.get(t)
+        if prior == "user_suppressed":
+            target[t] = "user_suppressed"
+        else:
+            target[t] = "auto"
+    for tag, state in existing.items():
+        if tag in target:
+            continue
+        if state in ("user_added", "user_suppressed"):
+            target[tag] = state
+        # state='auto' and not in new_auto → drop (don't copy into target)
+
+    conn.execute("DELETE FROM pq_tags WHERE pq_ref = ?", (pq_ref,))
+    if target:
+        conn.executemany(
+            "INSERT INTO pq_tags(pq_ref, tag, state) VALUES (?, ?, ?)",
+            [(pq_ref, t, s) for (t, s) in target.items()],
+        )
+    return _refresh_matched_topics(conn, pq_ref)
 
 
 def all_tags(conn: sqlite3.Connection) -> list[str]:
-    """Return the distinct tag set in use, sorted case-insensitively."""
+    """Distinct tags currently displayed somewhere (state IN auto/user_added),
+    sorted case-insensitively. Powers modal autocomplete."""
     rows = conn.execute(
-        "SELECT DISTINCT tag FROM tags ORDER BY LOWER(tag)"
+        """SELECT DISTINCT tag FROM pq_tags
+            WHERE state IN ('auto', 'user_added')
+            ORDER BY LOWER(tag)"""
     ).fetchall()
     return [r[0] for r in rows]
 
 
 def tag_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
-    """Distinct tags with their PQ usage counts, sorted by count desc then name."""
+    """For the /settings tag admin. Counts the *displayed* presence of each tag
+    (auto + user_added), regardless of source, sorted by count desc."""
     rows = conn.execute(
-        "SELECT tag, COUNT(*) AS n FROM tags GROUP BY tag ORDER BY n DESC, LOWER(tag)"
+        """SELECT tag, COUNT(*) AS n FROM pq_tags
+            WHERE state IN ('auto', 'user_added')
+            GROUP BY tag ORDER BY n DESC, LOWER(tag)"""
     ).fetchall()
     return [(r[0], r[1]) for r in rows]
 
 
 def rename_tag(conn: sqlite3.Connection, old: str, new: str) -> int:
-    """Rename a tag across every PQ that has it. Deduplicates if the target
-    already exists on the same PQ. Returns the number of PQs affected."""
+    """Rename a tag across every PQ that has it. Only touches state='user_added'
+    rows — renaming an 'auto' tag here would just be reverted on the next
+    rebuild, so we leave those alone and let the user rename the keyword in
+    topics.yaml instead. Returns the number of PQs affected."""
     new = (new or "").strip()
     old = (old or "").strip()
     if not new or not old or new.lower() == old.lower():
         return 0
-    # Find PQs that have the old tag.
     affected = [r[0] for r in conn.execute(
-        "SELECT pq_ref FROM tags WHERE tag = ?", (old,)
+        "SELECT pq_ref FROM pq_tags WHERE tag = ? AND state = 'user_added'", (old,)
     )]
     if not affected:
         return 0
-    # Insert new tag where missing, then delete old. Dedup is handled by PK.
+    # Insert new where missing, then drop old. PK collisions silently ignored.
     conn.executemany(
-        "INSERT OR IGNORE INTO tags(pq_ref, tag) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO pq_tags(pq_ref, tag, state) VALUES (?, ?, 'user_added')",
         [(p, new) for p in affected],
     )
-    conn.execute("DELETE FROM tags WHERE tag = ?", (old,))
+    conn.execute("DELETE FROM pq_tags WHERE tag = ? AND state = 'user_added'", (old,))
+    for p in affected:
+        _refresh_matched_topics(conn, p)
     return len(affected)
 
 
 def delete_tag(conn: sqlite3.Connection, tag: str) -> int:
-    """Remove a tag from every PQ. Returns rows deleted."""
-    cur = conn.execute("DELETE FROM tags WHERE tag = ?", ((tag or "").strip(),))
+    """Remove a user_added tag everywhere. Auto tags are left intact (use the
+    keyword settings to remove those). Returns rows deleted."""
+    tag = (tag or "").strip()
+    if not tag:
+        return 0
+    affected = [r[0] for r in conn.execute(
+        "SELECT pq_ref FROM pq_tags WHERE tag = ? AND state = 'user_added'", (tag,)
+    )]
+    cur = conn.execute(
+        "DELETE FROM pq_tags WHERE tag = ? AND state = 'user_added'", (tag,)
+    )
+    for p in affected:
+        _refresh_matched_topics(conn, p)
     return cur.rowcount
 
 
 def tags_by_pqref(conn: sqlite3.Connection) -> dict[str, list[str]]:
-    """Bulk-fetch tags grouped by pq_ref. Use this for exports."""
+    """Bulk-fetch the display tag set grouped by pq_ref. For exports."""
     out: dict[str, list[str]] = {}
-    for r in conn.execute("SELECT pq_ref, tag FROM tags ORDER BY pq_ref, tag"):
+    for r in conn.execute(
+        """SELECT pq_ref, tag FROM pq_tags
+            WHERE state IN ('auto', 'user_added')
+            ORDER BY pq_ref, LOWER(tag)"""
+    ):
+        out.setdefault(r[0], []).append(r[1])
+    return out
+
+
+def pq_tags_by_pqref(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    """Bulk-fetch the display rows (tag + state) per pq_ref. Used by the
+    list view to colour chips state-aware without per-row queries."""
+    out: dict[str, list[dict]] = {}
+    for r in conn.execute(
+        """SELECT pq_ref, tag, state FROM pq_tags
+            WHERE state IN ('auto', 'user_added')
+            ORDER BY pq_ref, LOWER(tag)"""
+    ):
+        out.setdefault(r[0], []).append({"tag": r[1], "state": r[2]})
+    return out
+
+
+def user_tags_by_pqref(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Bulk-fetch only the user_added subset, for the 'Tags (manual)' xlsx column."""
+    out: dict[str, list[str]] = {}
+    for r in conn.execute(
+        """SELECT pq_ref, tag FROM pq_tags
+            WHERE state = 'user_added'
+            ORDER BY pq_ref, LOWER(tag)"""
+    ):
         out.setdefault(r[0], []).append(r[1])
     return out
 

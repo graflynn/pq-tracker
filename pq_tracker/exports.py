@@ -25,11 +25,10 @@ XLSX_COLUMNS = [
     ("td_party", "Party", 14),
     ("td_constituency", "Constituency", 22),
     ("constituent", "Constituent (manual)", 24),
-    ("tags_csv", "Tags (manual)", 24),
     ("notes", "Notes (manual)", 32),
     ("department", "Dept", 14),
     ("minister_name", "Minister", 22),
-    ("matched_topics", "Matched Topics", 28),
+    ("matched_topics", "Tags", 28),
     ("answer_status", "Status", 10),
     ("question_text", "Question", 80),
     ("answer_text", "Answer", 80),
@@ -39,7 +38,6 @@ XLSX_COLUMNS = [
 
 
 def write_xlsx(rows: list[sqlite3.Row], dest,
-               tags_map: dict[str, list[str]] | None = None,
                answers_map: dict[str, str] | None = None) -> None:
     """Write the xlsx to ``dest``, which can be a Path or a writable file-like
     object (e.g. an in-memory BytesIO for streaming as an HTTP download).
@@ -47,8 +45,10 @@ def write_xlsx(rows: list[sqlite3.Row], dest,
     ``answers_map`` (pq_ref → answer_text) is required for the Answer column
     since the text lives on `answers`, not `questions`. Pass
     ``db.answers_by_pqref(conn)``.
+
+    The "Tags" column reads from ``row["matched_topics"]`` which is the
+    denormalized display set (auto + user_added) maintained on the row.
     """
-    tags_map = tags_map or {}
     answers_map = answers_map or {}
     if isinstance(dest, Path):
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -63,9 +63,7 @@ def write_xlsx(rows: list[sqlite3.Row], dest,
     ws.freeze_panes = "A2"
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, (key, _, _) in enumerate(XLSX_COLUMNS, start=1):
-            if key == "tags_csv":
-                value = ", ".join(tags_map.get(row["pq_ref"], []))
-            elif key == "answer_text":
+            if key == "answer_text":
                 value = answers_map.get(row["pq_ref"])
             else:
                 value = row[key] if key in row.keys() else None
@@ -90,16 +88,15 @@ def _safe_pq_ref_for_filename(pq_ref: str) -> str:
 
 
 def write_question_markdown(row: sqlite3.Row, out_dir: Path,
-                            tags: list[str] | None = None,
                             answer_text: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     safe = _safe_pq_ref_for_filename(row["pq_ref"])
     date_asked = row["date_asked"] or ""
     path = out_dir / f"PQ-{safe}-{date_asked}.md"
     try:
-        topics = ", ".join(json.loads(row["matched_topics"] or "[]"))
+        tags = json.loads(row["matched_topics"] or "[]")
     except json.JSONDecodeError:
-        topics = row["matched_topics"] or ""
+        tags = []
     lines: list[str] = []
     lines.append(f"# PQ {row['pq_ref']}")
     lines.append("")
@@ -112,7 +109,6 @@ def write_question_markdown(row: sqlite3.Row, out_dir: Path,
     if row["minister_name"]:
         lines.append(f"- **Minister:** {row['minister_name']}")
     lines.append(f"- **Status:** {row['answer_status']}")
-    lines.append(f"- **Matched topics:** {topics}")
     if tags:
         lines.append(f"- **Tags:** {', '.join(tags)}")
     if row["constituent"]:
@@ -195,7 +191,6 @@ def write_all(conn: sqlite3.Connection, run_started_iso: str,
     all_rows = db.all_questions(conn)
     rows_in_run = db.all_matches_in_run(conn, run_started_iso)
     pending_total = sum(1 for r in all_rows if r["answer_status"] == "pending")
-    tags_map = db.tags_by_pqref(conn)
     answers_map = db.answers_by_pqref(conn)
 
     # The xlsx is now an on-demand export ("Export to Excel" in the UI), so the
@@ -203,7 +198,6 @@ def write_all(conn: sqlite3.Connection, run_started_iso: str,
     for row in all_rows:
         write_question_markdown(
             row, cfg.QUESTIONS_DIR,
-            tags=tags_map.get(row["pq_ref"]),
             answer_text=answers_map.get(row["pq_ref"]),
         )
     write_summary(

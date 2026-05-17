@@ -18,13 +18,9 @@
     <dt>Department</dt><dd>{{ row.department }}</dd>
     {% if row.minister_name %}<dt>Minister</dt><dd>{{ row.minister_name }}</dd>{% endif %}
     <dt>Status</dt><dd><span class="status-{{ row.answer_status }}">{{ row.answer_status }}</span></dd>
-    <dt>Matched topics</dt><dd>
-      {% for t in row.matched_topics_list %}<span class="chip">{{ t }}</span>{% endfor %}
-      {% if not row.matched_topics_list %}<span style="color:var(--muted);">—</span>{% endif %}
-    </dd>
     <dt>Tags</dt><dd>
-      {% for t in row.tags %}<span class="chip chip-tag">{{ t }}</span>{% endfor %}
-      {% if not row.tags %}<span style="color:var(--muted);">—</span>{% endif %}
+      {% for tag in row.pq_tags %}<span class="chip{% if tag.state == 'user_added' %} chip-tag{% endif %}">{{ tag.tag }}</span>{% endfor %}
+      {% if not row.pq_tags %}<span style="color:var(--muted);">—</span>{% endif %}
     </dd>
     <dt>Permalink</dt><dd><a href="{{ row.oireachtas_permalink }}" target="_blank" rel="noopener">{{ row.oireachtas_permalink }}</a></dd>
     <dt>Source</dt><dd>{{ row.source }}</dd>
