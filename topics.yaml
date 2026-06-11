@@ -28,7 +28,9 @@ keywords:
 - continuous glucose monitor*:cgm
 - gestational
 - pregnan*:gestational
-lookback_days: 1
+- lti
+- long-term illness:lti
+lookback_days: 30
 chambers:
 - dail
 xml_fetch_delay_ms: 250
