@@ -6,10 +6,17 @@ on CPU, dimensions=384, vectors are already L2-normalized so cosine = dot.
 The embeddings table is keyed by (source_type, source_pq_ref / source_pdf_id,
 chunk_index) and rebuildable from source text. Vectors are stored as packed
 float32 BLOBs.
+
+Model cache lives at `<repo>/.fastembed_cache/` by default so Windows Storage
+Sense / TEMP cleaners don't quietly wipe it (which would manifest as
+"NO_SUCHFILE" errors on every embed call). Override with the env var
+FASTEMBED_CACHE to point somewhere else.
 """
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
 import sqlite3
 from datetime import datetime
 from typing import Iterable, Optional
@@ -21,6 +28,11 @@ log = logging.getLogger(__name__)
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DIMS = 384
 
+# Repo-local cache. Falls back to env var if the user wants to share across
+# checkouts.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+CACHE_DIR = pathlib.Path(os.environ.get("FASTEMBED_CACHE") or (_REPO_ROOT / ".fastembed_cache"))
+
 _model = None
 
 
@@ -31,8 +43,10 @@ def get_model():
         # Imported lazily so callers that only need pack/unpack don't pay the
         # fastembed/onnxruntime import cost.
         from fastembed import TextEmbedding
-        log.info("loading embedding model %s (first call may download ~120MB)", MODEL_NAME)
-        _model = TextEmbedding(MODEL_NAME)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        log.info("loading embedding model %s into %s (first call may download ~120MB)",
+                 MODEL_NAME, CACHE_DIR)
+        _model = TextEmbedding(MODEL_NAME, cache_dir=str(CACHE_DIR))
     return _model
 
 

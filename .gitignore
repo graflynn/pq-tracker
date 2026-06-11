@@ -15,6 +15,7 @@ questions/
 summary.md
 logs/
 hse_pdfs/
+.fastembed_cache/
 
 # Probe / scratch scripts (any file beginning with underscore at repo root)
 /_*.py
