@@ -30,6 +30,12 @@ keywords:
 - pregnan*:gestational
 - lti
 - long-term illness:lti
+- freestyle
+- freestyle:cgm
+- fgm:flash
+- fgm:cgm
+- flash glucose monitor*:flash
+- flash glucose monitor*:cgm
 lookback_days: 30
 chambers:
 - dail
