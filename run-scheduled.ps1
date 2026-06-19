@@ -43,9 +43,11 @@ $hseCode = $LASTEXITCODE
 # about.hse.ie per-ref for answered PQs that still have no HSE PDF and whose
 # answer defers to the HSE. The candidate set is bounded by that classifier
 # (plus manual labels); a last-checked cadence + per-run cap spread the lookups
-# politely so each candidate is re-polled roughly weekly without a flood.
+# politely. Ordered oldest-checked first, --limit 150/day x ~6.5 days covers the
+# ~970-candidate set, and --recheck-days 7 then lets the oldest batch come round
+# again -- a tidy weekly rotation in small daily slices (not one weekly flood).
 [System.IO.File]::AppendAllText($log, "`r`n--- phase 3: hse backfill-missing (cadence) ---`r`n", $utf8)
-$output = & $py -m pq_tracker.hse_cli backfill-missing --recheck-days 6 --limit 200 2>&1 | Out-String
+$output = & $py -m pq_tracker.hse_cli backfill-missing --recheck-days 7 --limit 150 2>&1 | Out-String
 $hseMissingCode = $LASTEXITCODE
 [System.IO.File]::AppendAllText($log, $output, $utf8)
 [System.IO.File]::AppendAllText($log, "--- hse backfill-missing exit code: $hseMissingCode ---`r`n", $utf8)
