@@ -41,17 +41,11 @@ $hseCode = $LASTEXITCODE
 # The phase-2 page-walk can't reach answers HSE injects far down the date-ordered
 # listing (they are back-dated to the PQ's original month). So we query
 # about.hse.ie per-ref for answered PQs that still have no HSE PDF and whose
-# answer text defers to the HSE for a direct reply. Cheap on a rolling window
-# day-to-day; once a week (Sunday) we sweep the full unlinked set as a deep check.
-if ((Get-Date).DayOfWeek -eq "Sunday") {
-    $missingArgs = @("-m", "pq_tracker.hse_cli", "backfill-missing", "--all")
-    $missingLabel = "phase 3: hse backfill-missing (weekly deep sweep --all)"
-} else {
-    $missingArgs = @("-m", "pq_tracker.hse_cli", "backfill-missing", "--days", "150")
-    $missingLabel = "phase 3: hse backfill-missing (rolling 150d window)"
-}
-[System.IO.File]::AppendAllText($log, "`r`n--- $missingLabel ---`r`n", $utf8)
-$output = & $py @missingArgs 2>&1 | Out-String
+# answer defers to the HSE. The candidate set is bounded by that classifier
+# (plus manual labels); a last-checked cadence + per-run cap spread the lookups
+# politely so each candidate is re-polled roughly weekly without a flood.
+[System.IO.File]::AppendAllText($log, "`r`n--- phase 3: hse backfill-missing (cadence) ---`r`n", $utf8)
+$output = & $py -m pq_tracker.hse_cli backfill-missing --recheck-days 6 --limit 200 2>&1 | Out-String
 $hseMissingCode = $LASTEXITCODE
 [System.IO.File]::AppendAllText($log, $output, $utf8)
 [System.IO.File]::AppendAllText($log, "--- hse backfill-missing exit code: $hseMissingCode ---`r`n", $utf8)

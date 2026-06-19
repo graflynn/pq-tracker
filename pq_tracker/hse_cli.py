@@ -362,30 +362,43 @@ def cmd_ingest(args) -> int:
 
 # ---------------- targeted backfill of missing HSE answers ----------------
 
-def _missing_answer_candidates(conn, *, all_unlinked: bool, days: int | None) -> list[str]:
-    """Answered PQs in our corpus that have no HSE PDF linked yet.
+def _missing_answer_candidates(conn, *, all_unlinked: bool, days: int | None,
+                               recheck_days: int | None) -> list[str]:
+    """Answered PQs in our corpus that have no HSE PDF linked yet, ordered for a
+    cadence-based sweep (never-checked first, then least-recently-checked).
 
-    Default keeps only PQs whose answer text defers to the HSE for a direct
-    reply (``answer_defers_to_hse``) — the ones that actually receive a
-    supplementary PDF. ``all_unlinked=True`` drops that filter. ``days``
-    restricts to PQs answered within the last N days (rolling window).
+    Selection:
+      - excludes PQs manually marked 'not expected' (hse_expected_manual = 0)
+      - default keeps PQs whose answer defers to the HSE (answer_defers_to_hse)
+        OR are manually forced 'expected' (hse_expected_manual = 1)
+      - all_unlinked=True keeps every unlinked answered PQ (still honouring the
+        manual 'not expected' exclusion)
+      - days: optional floor on date_answered (last N days)
+      - recheck_days: skip rows checked within the last N days (cadence)
     """
     sql = [
-        "SELECT q.pq_ref, q.date_answered, a.answer_text",
+        "SELECT q.pq_ref, q.hse_expected_manual AS manual, a.answer_text",
         "  FROM questions q LEFT JOIN answers a ON a.id = q.answer_id",
         " WHERE q.answer_status = 'answered'",
         "   AND NOT EXISTS (SELECT 1 FROM hse_pdf_pqs l WHERE l.pq_ref = q.pq_ref)",
+        "   AND COALESCE(q.hse_expected_manual, -1) != 0",  # never 'force not-expected'
     ]
     params: list = []
     if days is not None:
-        cutoff = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
         sql.append("   AND q.date_answered >= ?")
-        params.append(cutoff)
-    sql.append(" ORDER BY q.date_answered DESC, q.pq_ref")
+        params.append((datetime.utcnow().date() - timedelta(days=days)).isoformat())
+    if recheck_days is not None:
+        sql.append("   AND (q.hse_last_checked IS NULL OR q.hse_last_checked < ?)")
+        cutoff = datetime.utcnow() - timedelta(days=recheck_days)
+        params.append(cutoff.isoformat(timespec="seconds"))
+    # NULLs sort first in ASC, so never-checked rows lead, then oldest checks.
+    sql.append(" ORDER BY q.hse_last_checked ASC, q.date_answered DESC, q.pq_ref")
     rows = conn.execute("\n".join(sql), params).fetchall()
-    if all_unlinked:
-        return [r["pq_ref"] for r in rows]
-    return [r["pq_ref"] for r in rows if answer_defers_to_hse(r["answer_text"])]
+    out = []
+    for r in rows:
+        if all_unlinked or r["manual"] == 1 or answer_defers_to_hse(r["answer_text"]):
+            out.append(r["pq_ref"])
+    return out
 
 
 def cmd_backfill_missing(args) -> int:
@@ -396,12 +409,15 @@ def cmd_backfill_missing(args) -> int:
     with db.connect(cfg.DB_PATH) as conn:
         db.init_schema(conn)
         known = db.hse_pdf_source_urls(conn)
-        refs = _missing_answer_candidates(conn, all_unlinked=args.all, days=args.days)
+        refs = _missing_answer_candidates(conn, all_unlinked=args.all, days=args.days,
+                                          recheck_days=args.recheck_days)
+        total_candidates = len(refs)
         if args.limit:
             refs = refs[: args.limit]
-        log.info("=== HSE backfill-missing start: %d candidate ref(s) "
-                 "(all_unlinked=%s, days=%s, limit=%s) ===",
-                 len(refs), args.all, args.days, args.limit)
+        log.info("=== HSE backfill-missing start: %d of %d candidate ref(s) "
+                 "(all_unlinked=%s, days=%s, recheck_days=%s, limit=%s) ===",
+                 len(refs), total_candidates, args.all, args.days,
+                 args.recheck_days, args.limit)
 
         stats = {"checked": 0, "pubs_found": 0, "downloaded": 0,
                  "linked": 0, "none": 0, "error": 0}
@@ -413,6 +429,10 @@ def cmd_backfill_missing(args) -> int:
                 log.warning("search failed for %s: %s", ref, e)
                 stats["error"] += 1
                 continue
+            # Record the attempt regardless of outcome so the cadence advances
+            # (a fruitless check still counts — we won't re-poll it immediately).
+            db.mark_hse_checked(conn, ref)
+            conn.commit()
             if not pub_urls:
                 stats["none"] += 1
             else:
@@ -526,10 +546,14 @@ def main(argv: list[str] | None = None) -> int:
                          "defers to the HSE for a direct reply (~96%% of real HSE answers, "
                          "far fewer queries).")
     pm.add_argument("--days", type=int, default=None,
-                    help="Only PQs answered within the last N days (rolling window for "
-                         "scheduled runs). Default: no limit.")
+                    help="Only PQs answered within the last N days. Default: no limit.")
+    pm.add_argument("--recheck-days", type=int, default=None,
+                    help="Skip PQs already checked within the last N days (cadence). "
+                         "Never-checked PQs are always checked first. Default: no limit "
+                         "(check every candidate).")
     pm.add_argument("--limit", type=int, default=None,
-                    help="Cap the number of refs checked this run.")
+                    help="Cap the number of refs checked this run (per-run budget). "
+                         "Combined with --recheck-days this spreads the sweep politely.")
     pm.add_argument("--delay-live", type=float, default=1.0,
                     help="Seconds between live-site requests.")
     pm.set_defaults(func=cmd_backfill_missing)

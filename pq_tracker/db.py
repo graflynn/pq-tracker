@@ -245,6 +245,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE questions ADD COLUMN question_group_key TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_q_group_key "
                      "  ON questions(question_group_key)")
+    if "hse_expected_manual" not in cols:
+        # Manual override for the "expects an HSE supplementary answer" label.
+        # NULL = trust the classifier (matching.answer_defers_to_hse); 1 = force
+        # "expected" (e.g. classifier missed it); 0 = force "not expected"
+        # (suppress fruitless lookups). Drives hse_cli backfill-missing.
+        conn.execute("ALTER TABLE questions ADD COLUMN hse_expected_manual INTEGER")
+    if "hse_last_checked" not in cols:
+        # ISO timestamp of the last about.hse.ie ?query= lookup for this PQ.
+        # The scheduled backfill checks never-checked rows first, then the
+        # least-recently-checked, so each candidate is re-polled on a cadence
+        # without flooding HSE. NULL = never checked.
+        conn.execute("ALTER TABLE questions ADD COLUMN hse_last_checked TEXT")
     # Backfill answers/answer_id from legacy `answer_text` column when it
     # still exists (pre-2026-05-17 schema). Each run hashes every answered
     # row missing an answer_id, upserts into `answers`, and points back.
@@ -671,6 +683,30 @@ def update_manual_fields(conn: sqlite3.Connection, pq_ref: str,
 
 def get_question(conn: sqlite3.Connection, pq_ref: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM questions WHERE pq_ref = ?", (pq_ref,)).fetchone()
+
+
+def set_hse_expected_manual(conn: sqlite3.Connection, pq_ref: str,
+                            value: int | None) -> bool:
+    """Set the manual 'expects an HSE answer' override. value: None (trust the
+    classifier), 1 (force expected), or 0 (force not-expected). Returns True if
+    a row was updated."""
+    if value not in (None, 0, 1):
+        raise ValueError("hse_expected_manual must be None, 0, or 1")
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur = conn.execute(
+        "UPDATE questions SET hse_expected_manual = ?, last_updated_at = ? WHERE pq_ref = ?",
+        (value, now, pq_ref),
+    )
+    return cur.rowcount > 0
+
+
+def mark_hse_checked(conn: sqlite3.Connection, pq_ref: str,
+                     when_iso: str | None = None) -> None:
+    """Record that we just ran an about.hse.ie lookup for this PQ."""
+    conn.execute(
+        "UPDATE questions SET hse_last_checked = ? WHERE pq_ref = ?",
+        (when_iso or datetime.utcnow().isoformat(timespec="seconds"), pq_ref),
+    )
 
 
 _Q_EID_RE = re.compile(r'<question\s+[^>]*?eId="([^"]+)"')

@@ -85,32 +85,39 @@ def match_search_terms(text: str, terms: list[str]) -> bool:
     return False
 
 
-# A PQ answer "defers to the HSE" when the Minister refers it to the HSE for a
-# direct reply rather than answering in the chamber. Those PQs are the ones
-# that get a separate HSE supplementary PDF published on about.hse.ie — so this
-# predicate is a cheap classifier for "this PQ likely has (or will get) an HSE
-# answer PDF". Validated at ~96% recall against PQs we already have HSE PDFs
-# linked for (844/874). See hse_cli `backfill-missing`.
-_HSE_MENTION_RE = re.compile(r"health service executive|\bhse\b", re.IGNORECASE)
-_HSE_DIRECT_RE = re.compile(
-    r"direct reply"
-    r"|reply directly"
-    r"|respond[^.]{0,40}directly"
-    r"|directly to the deputy"
-    r"|refer[a-z]*[^.]{0,80}\bhse\b[^.]{0,80}direct",
+# A PQ answer "defers to the HSE" when the Minister hands it to the HSE for a
+# reply rather than answering in the chamber. Those PQs are the ones that get a
+# separate HSE supplementary PDF published on about.hse.ie — so this predicate
+# is a cheap classifier for "this PQ likely has (or will get) an HSE answer
+# PDF", used to decide which refs are worth a targeted about.hse.ie lookup.
+#
+# Because a misfire only costs a fruitless ?query= (no false link — the lookup
+# is year-exact), we tune for RECALL over precision. The two parts are an HSE
+# mention plus any hand-off cue (referral / asked-to-reply / reply-respond to
+# the Deputy). Validated at ~99.8% recall against PQs we already have linked
+# (885/887); the 2 residual misses are coreference cases ("asked them … provide
+# a response to him"). See hse_cli `backfill-missing`.
+_HSE = r"(?:hse|health service executive)"
+_HSE_MENTION_RE = re.compile(_HSE, re.IGNORECASE)
+_HSE_DEFER_RE = re.compile(
+    rf"refer[a-z]*[^.]{{0,50}}{_HSE}"                       # "referred ... to the HSE"
+    rf"|{_HSE}[^.]{{0,50}}refer"                            # "HSE ... this has been referred"
+    rf"|(?:asked|requested)[^.]{{0,30}}{_HSE}"              # "asked the HSE to ..."
+    rf"|{_HSE}[^.]{{0,30}}(?:has |have |been )*(?:asked|requested)"  # "HSE has been asked"
+    rf"|{_HSE}[^.]{{0,40}}to (?:reply|respond|revert)"      # "HSE to respond"
+    rf"|(?:reply|respond|revert)[^.]{{0,40}}(?:directly|to the deput|to you|to him|to her)",
     re.IGNORECASE,
 )
 
 
 def answer_defers_to_hse(answer_text: str | None) -> bool:
-    """Heuristic: does this answer hand the PQ off to the HSE for a direct reply?
+    """Heuristic: does this answer hand the PQ off to the HSE for a reply?
 
-    Looks for an HSE mention alongside 'direct reply' / 'reply directly' /
-    'respond … directly' phrasing — e.g. "the HSE has been asked to reply
-    directly to the Deputy" or "referred to the HSE … for direct reply". These
-    are exactly the PQs that receive a supplementary HSE PDF answer, so callers
-    use this to decide which refs are worth a targeted about.hse.ie lookup.
+    True when the text mentions the HSE and carries a hand-off cue — e.g.
+    "the HSE has been asked to reply directly to the Deputy", "referred to the
+    HSE for reply to the Deputies", "I have asked the HSE to respond". Tuned for
+    recall (a false positive only triggers a harmless, fruitless lookup).
     """
     if not answer_text:
         return False
-    return bool(_HSE_MENTION_RE.search(answer_text) and _HSE_DIRECT_RE.search(answer_text))
+    return bool(_HSE_MENTION_RE.search(answer_text) and _HSE_DEFER_RE.search(answer_text))
