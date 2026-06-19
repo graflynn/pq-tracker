@@ -36,6 +36,7 @@ keywords:
 - fgm:cgm
 - flash glucose monitor*:flash
 - flash glucose monitor*:cgm
+- freestyle:flash
 lookback_days: 30
 chambers:
 - dail
