@@ -1,9 +1,10 @@
 """CLI entry point for HSE PDF scraping.
 
 Subcommands:
-  backfill   one-off full scrape of live + Wayback PDFs (resumable)
-  ingest     incremental: walk live site page 1+ until we hit a URL we already have
-  stats      report counts of HSE PDFs / matched PQ refs
+  backfill          one-off full scrape of live + Wayback PDFs (resumable)
+  ingest            incremental: walk live site page 1+ until we hit a known URL
+  backfill-missing  targeted ?query= lookup for answered PQs with no HSE link
+  stats             report counts of HSE PDFs / matched PQ refs
 """
 from __future__ import annotations
 
@@ -12,13 +13,14 @@ import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import config as cfg
 from . import db
 from . import hse_scraper as scraper
 from . import hse_text
+from .matching import answer_defers_to_hse
 
 log = logging.getLogger(__name__)
 
@@ -358,6 +360,102 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+# ---------------- targeted backfill of missing HSE answers ----------------
+
+def _missing_answer_candidates(conn, *, all_unlinked: bool, days: int | None) -> list[str]:
+    """Answered PQs in our corpus that have no HSE PDF linked yet.
+
+    Default keeps only PQs whose answer text defers to the HSE for a direct
+    reply (``answer_defers_to_hse``) — the ones that actually receive a
+    supplementary PDF. ``all_unlinked=True`` drops that filter. ``days``
+    restricts to PQs answered within the last N days (rolling window).
+    """
+    sql = [
+        "SELECT q.pq_ref, q.date_answered, a.answer_text",
+        "  FROM questions q LEFT JOIN answers a ON a.id = q.answer_id",
+        " WHERE q.answer_status = 'answered'",
+        "   AND NOT EXISTS (SELECT 1 FROM hse_pdf_pqs l WHERE l.pq_ref = q.pq_ref)",
+    ]
+    params: list = []
+    if days is not None:
+        cutoff = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+        sql.append("   AND q.date_answered >= ?")
+        params.append(cutoff)
+    sql.append(" ORDER BY q.date_answered DESC, q.pq_ref")
+    rows = conn.execute("\n".join(sql), params).fetchall()
+    if all_unlinked:
+        return [r["pq_ref"] for r in rows]
+    return [r["pq_ref"] for r in rows if answer_defers_to_hse(r["answer_text"])]
+
+
+def cmd_backfill_missing(args) -> int:
+    log_path = _configure_logging("hse-backfill-missing")
+    cfg.ensure_dirs()
+    cfg.HSE_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    session = scraper.make_session()
+    with db.connect(cfg.DB_PATH) as conn:
+        db.init_schema(conn)
+        known = db.hse_pdf_source_urls(conn)
+        refs = _missing_answer_candidates(conn, all_unlinked=args.all, days=args.days)
+        if args.limit:
+            refs = refs[: args.limit]
+        log.info("=== HSE backfill-missing start: %d candidate ref(s) "
+                 "(all_unlinked=%s, days=%s, limit=%s) ===",
+                 len(refs), args.all, args.days, args.limit)
+
+        stats = {"checked": 0, "pubs_found": 0, "downloaded": 0,
+                 "linked": 0, "none": 0, "error": 0}
+        for i, ref in enumerate(refs, 1):
+            stats["checked"] += 1
+            try:
+                pub_urls = scraper.search_live_by_ref(session, ref, delay_s=args.delay_live)
+            except Exception as e:  # noqa: BLE001
+                log.warning("search failed for %s: %s", ref, e)
+                stats["error"] += 1
+                continue
+            if not pub_urls:
+                stats["none"] += 1
+            else:
+                stats["pubs_found"] += 1
+            for pub_url in pub_urls:
+                item = scraper.fetch_live_publication(session, pub_url, delay_s=args.delay_live)
+                if item is None:
+                    stats["error"] += 1
+                    continue
+                # HSE's search matched this ref even if the PDF filename names a
+                # different lead ref (bundled answers). upsert_hse_pdf replaces
+                # the whole junction, so pass parsed refs ∪ {ref} — never just
+                # {ref} — to add the missing link without clobbering existing.
+                if ref not in item.pq_refs:
+                    item.pq_refs = item.pq_refs + [ref]
+                try:
+                    target = scraper.storage_path(cfg.HSE_PDF_DIR, item)
+                    have_file = target.exists() and target.stat().st_size > 0
+                    if item.source_url in known or have_file:
+                        # Already held on disk / in DB — (re)link only.
+                        sha = bytes_size = None
+                        local = target if have_file else None
+                    else:
+                        sha, bytes_size = scraper.download_pdf(
+                            session, item.source_url, target, delay_s=args.delay_live)
+                        local = target
+                        stats["downloaded"] += 1
+                    pdf_id = _save(conn, item, local, sha, bytes_size)
+                    _extract_after_download(conn, pdf_id, item.pq_refs)
+                    conn.commit()
+                    known.add(item.source_url)
+                    stats["linked"] += 1
+                    log.info("linked %s -> pdf_id=%d (%s)", ref, pdf_id, item.filename[:55])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("backfill failed for %s (%s): %s", ref, pub_url, e)
+                    stats["error"] += 1
+            if (i % 25) == 0:
+                log.info("progress: %d/%d stats=%s", i, len(refs), stats)
+        log.info("=== backfill-missing done: stats=%s ===", stats)
+        log.info("log: %s", log_path)
+    return 0
+
+
 # ---------------- stats ----------------
 
 def cmd_stats(args) -> int:
@@ -418,6 +516,23 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--max-pages", type=int, default=20,
                     help="Hard upper bound on listing pages walked.")
     pi.set_defaults(func=cmd_ingest)
+
+    pm = sub.add_parser("backfill-missing",
+                        help="Targeted ?query= lookup for answered PQs with no HSE link. "
+                             "Reaches answers back-published deep in the listing that the "
+                             "page-walk can't.")
+    pm.add_argument("--all", action="store_true",
+                    help="Check every unlinked answered PQ. Default: only those whose answer "
+                         "defers to the HSE for a direct reply (~96%% of real HSE answers, "
+                         "far fewer queries).")
+    pm.add_argument("--days", type=int, default=None,
+                    help="Only PQs answered within the last N days (rolling window for "
+                         "scheduled runs). Default: no limit.")
+    pm.add_argument("--limit", type=int, default=None,
+                    help="Cap the number of refs checked this run.")
+    pm.add_argument("--delay-live", type=float, default=1.0,
+                    help="Seconds between live-site requests.")
+    pm.set_defaults(func=cmd_backfill_missing)
 
     ps = sub.add_parser("stats", help="Print counts of HSE PDFs in the DB.")
     ps.set_defaults(func=cmd_stats)

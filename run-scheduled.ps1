@@ -37,8 +37,29 @@ $hseCode = $LASTEXITCODE
 [System.IO.File]::AppendAllText($log, $output, $utf8)
 [System.IO.File]::AppendAllText($log, "--- hse exit code: $hseCode ---`r`n", $utf8)
 
-# Combined exit: if either phase failed, surface the worse code so Task Scheduler
-# shows the run as failed in the History panel.
-$code = if ($oireachtasCode -ne 0) { $oireachtasCode } else { $hseCode }
+# Phase 3: HSE targeted backfill of answers back-published deep in the listing.
+# The phase-2 page-walk can't reach answers HSE injects far down the date-ordered
+# listing (they are back-dated to the PQ's original month). So we query
+# about.hse.ie per-ref for answered PQs that still have no HSE PDF and whose
+# answer text defers to the HSE for a direct reply. Cheap on a rolling window
+# day-to-day; once a week (Sunday) we sweep the full unlinked set as a deep check.
+if ((Get-Date).DayOfWeek -eq "Sunday") {
+    $missingArgs = @("-m", "pq_tracker.hse_cli", "backfill-missing", "--all")
+    $missingLabel = "phase 3: hse backfill-missing (weekly deep sweep --all)"
+} else {
+    $missingArgs = @("-m", "pq_tracker.hse_cli", "backfill-missing", "--days", "150")
+    $missingLabel = "phase 3: hse backfill-missing (rolling 150d window)"
+}
+[System.IO.File]::AppendAllText($log, "`r`n--- $missingLabel ---`r`n", $utf8)
+$output = & $py @missingArgs 2>&1 | Out-String
+$hseMissingCode = $LASTEXITCODE
+[System.IO.File]::AppendAllText($log, $output, $utf8)
+[System.IO.File]::AppendAllText($log, "--- hse backfill-missing exit code: $hseMissingCode ---`r`n", $utf8)
+
+# Combined exit: if any phase failed, surface the first non-zero code so Task
+# Scheduler shows the run as failed in the History panel.
+$code = if ($oireachtasCode -ne 0) { $oireachtasCode }
+        elseif ($hseCode -ne 0) { $hseCode }
+        else { $hseMissingCode }
 [System.IO.File]::AppendAllText($log, "`r`n--- final exit code: $code ---`r`n", $utf8)
 exit $code

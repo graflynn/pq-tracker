@@ -144,6 +144,45 @@ def pq_refs_from_text(s: str) -> list[str]:
     return out
 
 
+def search_live_by_ref(session: requests.Session, ref: str, *,
+                        delay_s: float = 1.0) -> list[str]:
+    """Find live publication page(s) for a single PQ ref via the site search.
+
+    The publications listing accepts ``?query=<number>``, returning matching
+    'Responses to parliamentary questions' entries regardless of how deep they
+    sit in the date-ordered listing. This is the only reliable way to reach
+    answers HSE back-published deep in the page tree (the daily page-walk caps
+    out long before them — see hse_cli ``backfill-missing``).
+
+    ``ref`` may be 'num/yy' or bare 'num'; only the numeric part is searched.
+    Returns absolute publication URLs whose slug actually contains ``pq-<num>-``
+    (the search is broad, so we filter to true ref matches), deduped in order.
+    """
+    num = ref.split("/")[0].strip()
+    if not num.isdigit():
+        return []
+    url = (
+        "https://about.hse.ie/publications/"
+        f"?query={urllib.parse.quote(num)}"
+        "&type=Responses+to+parliamentary+questions"
+    )
+    r = _polite_get(session, url, delay_s=delay_s)
+    if r.status_code != 200:
+        log.warning("live search for %s returned HTTP %d", ref, r.status_code)
+        return []
+    needle = re.compile(rf"pq-0*{int(num)}-\d{{2}}", re.IGNORECASE)
+    out: list[str] = []
+    seen: set[str] = set()
+    for href in _LIVE_ANCHOR_RE.findall(r.text):
+        if not needle.search(href):
+            continue
+        full = urllib.parse.urljoin("https://about.hse.ie/", href)
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out
+
+
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})

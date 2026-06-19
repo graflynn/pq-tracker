@@ -83,3 +83,34 @@ def match_search_terms(text: str, terms: list[str]) -> bool:
         if _compile(match).search(text):
             return True
     return False
+
+
+# A PQ answer "defers to the HSE" when the Minister refers it to the HSE for a
+# direct reply rather than answering in the chamber. Those PQs are the ones
+# that get a separate HSE supplementary PDF published on about.hse.ie — so this
+# predicate is a cheap classifier for "this PQ likely has (or will get) an HSE
+# answer PDF". Validated at ~96% recall against PQs we already have HSE PDFs
+# linked for (844/874). See hse_cli `backfill-missing`.
+_HSE_MENTION_RE = re.compile(r"health service executive|\bhse\b", re.IGNORECASE)
+_HSE_DIRECT_RE = re.compile(
+    r"direct reply"
+    r"|reply directly"
+    r"|respond[^.]{0,40}directly"
+    r"|directly to the deputy"
+    r"|refer[a-z]*[^.]{0,80}\bhse\b[^.]{0,80}direct",
+    re.IGNORECASE,
+)
+
+
+def answer_defers_to_hse(answer_text: str | None) -> bool:
+    """Heuristic: does this answer hand the PQ off to the HSE for a direct reply?
+
+    Looks for an HSE mention alongside 'direct reply' / 'reply directly' /
+    'respond … directly' phrasing — e.g. "the HSE has been asked to reply
+    directly to the Deputy" or "referred to the HSE … for direct reply". These
+    are exactly the PQs that receive a supplementary HSE PDF answer, so callers
+    use this to decide which refs are worth a targeted about.hse.ie lookup.
+    """
+    if not answer_text:
+        return False
+    return bool(_HSE_MENTION_RE.search(answer_text) and _HSE_DIRECT_RE.search(answer_text))
