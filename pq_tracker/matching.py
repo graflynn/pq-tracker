@@ -91,32 +91,36 @@ def match_search_terms(text: str, terms: list[str]) -> bool:
 # is a cheap classifier for "this PQ likely has (or will get) an HSE answer
 # PDF", used to decide which refs are worth a targeted about.hse.ie lookup.
 #
-# Because a misfire only costs a fruitless ?query= (no false link — the lookup
-# is year-exact), we tune for RECALL over precision. The two parts are an HSE
-# mention plus any hand-off cue (referral / asked-to-reply / reply-respond to
-# the Deputy). Validated at ~99.8% recall against PQs we already have linked
-# (885/887); the 2 residual misses are coreference cases ("asked them … provide
-# a response to him"). See hse_cli `backfill-missing`.
+# A misfire only costs a fruitless year-exact ?query= (no false link), so we
+# lean toward recall — but the deferral must hand the answer to the HSE *for a
+# reply to the Deputy*. A bare "I have asked the HSE for an update" inside an
+# otherwise-substantive in-chamber answer is NOT a deferral (e.g. 35643/26), so
+# we require a referral, or an HSE→reply/provide verb, or a reply/provide→Deputy
+# target — never a lone "asked the HSE". Validated at ~99.8% recall against PQs
+# we already have linked (885/887); the residual 2 are non-deferrals (a
+# service-update answer + a "I will forward it to the Deputy" case) that merely
+# happen to carry a linked PDF. See hse_cli `backfill-missing`.
 _HSE = r"(?:hse|health service executive)"
+_HSE_VERB = r"(?:reply|respond|revert|provide)"
 _HSE_MENTION_RE = re.compile(_HSE, re.IGNORECASE)
 _HSE_DEFER_RE = re.compile(
-    rf"refer[a-z]*[^.]{{0,50}}{_HSE}"                       # "referred ... to the HSE"
-    rf"|{_HSE}[^.]{{0,50}}refer"                            # "HSE ... this has been referred"
-    rf"|(?:asked|requested)[^.]{{0,30}}{_HSE}"              # "asked the HSE to ..."
-    rf"|{_HSE}[^.]{{0,30}}(?:has |have |been )*(?:asked|requested)"  # "HSE has been asked"
-    rf"|{_HSE}[^.]{{0,40}}to (?:reply|respond|revert)"      # "HSE to respond"
-    rf"|(?:reply|respond|revert)[^.]{{0,40}}(?:directly|to the deput|to you|to him|to her)",
+    rf"refer[a-z]*[^.]{{0,50}}{_HSE}"                          # "referred ... to the HSE"
+    rf"|{_HSE}[^.]{{0,50}}refer"                               # "HSE ... this has been referred"
+    rf"|{_HSE}[^.]{{0,40}}to {_HSE_VERB}"                      # "the HSE has been asked to reply"
+    rf"|{_HSE_VERB}[^.]{{0,40}}(?:directly|to the deput|to you|to him|to her)",  # "...reply directly to the Deputy"
     re.IGNORECASE,
 )
 
 
 def answer_defers_to_hse(answer_text: str | None) -> bool:
-    """Heuristic: does this answer hand the PQ off to the HSE for a reply?
+    """Heuristic: does this answer hand the PQ off to the HSE for a direct reply?
 
-    True when the text mentions the HSE and carries a hand-off cue — e.g.
-    "the HSE has been asked to reply directly to the Deputy", "referred to the
-    HSE for reply to the Deputies", "I have asked the HSE to respond". Tuned for
-    recall (a false positive only triggers a harmless, fruitless lookup).
+    True when the text mentions the HSE and carries a deferral cue — a referral
+    to the HSE, an HSE→reply/respond/provide verb, or a reply/provide aimed at
+    the Deputy ("directly"/"to the Deputy"). e.g. "the HSE has been asked to
+    reply directly to the Deputy", "referred to the HSE for reply to the
+    Deputies". A bare "I have asked the HSE for an update" is deliberately NOT
+    matched — that appears in substantive answers that get no separate PDF.
     """
     if not answer_text:
         return False
