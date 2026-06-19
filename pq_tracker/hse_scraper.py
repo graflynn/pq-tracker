@@ -154,11 +154,16 @@ def search_live_by_ref(session: requests.Session, ref: str, *,
     answers HSE back-published deep in the page tree (the daily page-walk caps
     out long before them — see hse_cli ``backfill-missing``).
 
-    ``ref`` may be 'num/yy' or bare 'num'; only the numeric part is searched.
-    Returns absolute publication URLs whose slug actually contains ``pq-<num>-``
-    (the search is broad, so we filter to true ref matches), deduped in order.
+    ``ref`` may be 'num/yy' or bare 'num'. The site search is by number only,
+    so when a year is given we filter the results to that exact year — numbers
+    repeat across years (8055/25 vs 8055/26) and matching number-only would
+    link the wrong year's PDF. Returns absolute publication URLs whose slug
+    contains the exact ``pq-<num>-<yy>`` (or any year when ``ref`` is bare),
+    deduped in order.
     """
-    num = ref.split("/")[0].strip()
+    parts = ref.split("/")
+    num = parts[0].strip()
+    yr = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
     if not num.isdigit():
         return []
     url = (
@@ -170,7 +175,8 @@ def search_live_by_ref(session: requests.Session, ref: str, *,
     if r.status_code != 200:
         log.warning("live search for %s returned HTTP %d", ref, r.status_code)
         return []
-    needle = re.compile(rf"pq-0*{int(num)}-\d{{2}}", re.IGNORECASE)
+    yr_pat = re.escape(yr) if yr else r"\d{2}"
+    needle = re.compile(rf"pq-0*{int(num)}-{yr_pat}(?!\d)", re.IGNORECASE)
     out: list[str] = []
     seen: set[str] = set()
     for href in _LIVE_ANCHOR_RE.findall(r.text):
