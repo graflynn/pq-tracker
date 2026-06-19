@@ -401,6 +401,55 @@ def _missing_answer_candidates(conn, *, all_unlinked: bool, days: int | None,
     return out
 
 
+def backfill_ref(session, conn, ref: str, *, known: set[str],
+                 delay_s: float = 1.0) -> dict:
+    """Targeted ?query= lookup + link/extract for one PQ ref.
+
+    Searches about.hse.ie for the exact ref, marks the ref checked (cadence
+    advances even on a miss), and for each matching publication downloads (if
+    not already held) + links + extracts. Returns counts and the linked
+    pdf_ids. Reused by the CLI sweep and the UI "Check HSE now" button.
+    """
+    out = {"found": 0, "downloaded": 0, "linked": 0, "pdf_ids": [], "errors": 0}
+    pub_urls = scraper.search_live_by_ref(session, ref, delay_s=delay_s)
+    db.mark_hse_checked(conn, ref)
+    conn.commit()
+    out["found"] = len(pub_urls)
+    for pub_url in pub_urls:
+        item = scraper.fetch_live_publication(session, pub_url, delay_s=delay_s)
+        if item is None:
+            out["errors"] += 1
+            continue
+        # HSE's search matched this ref even if the PDF filename names a
+        # different lead ref (bundled answers). upsert_hse_pdf replaces the
+        # whole junction, so pass parsed refs ∪ {ref} — never just {ref} — to
+        # add the missing link without clobbering existing ones.
+        if ref not in item.pq_refs:
+            item.pq_refs = item.pq_refs + [ref]
+        try:
+            target = scraper.storage_path(cfg.HSE_PDF_DIR, item)
+            have_file = target.exists() and target.stat().st_size > 0
+            if item.source_url in known or have_file:
+                sha = bytes_size = None
+                local = target if have_file else None
+            else:
+                sha, bytes_size = scraper.download_pdf(
+                    session, item.source_url, target, delay_s=delay_s)
+                local = target
+                out["downloaded"] += 1
+            pdf_id = _save(conn, item, local, sha, bytes_size)
+            _extract_after_download(conn, pdf_id, item.pq_refs)
+            conn.commit()
+            known.add(item.source_url)
+            out["linked"] += 1
+            out["pdf_ids"].append(pdf_id)
+            log.info("linked %s -> pdf_id=%d (%s)", ref, pdf_id, item.filename[:55])
+        except Exception as e:  # noqa: BLE001
+            log.warning("backfill failed for %s (%s): %s", ref, pub_url, e)
+            out["errors"] += 1
+    return out
+
+
 def cmd_backfill_missing(args) -> int:
     log_path = _configure_logging("hse-backfill-missing")
     cfg.ensure_dirs()
@@ -424,51 +473,16 @@ def cmd_backfill_missing(args) -> int:
         for i, ref in enumerate(refs, 1):
             stats["checked"] += 1
             try:
-                pub_urls = scraper.search_live_by_ref(session, ref, delay_s=args.delay_live)
+                res = backfill_ref(session, conn, ref, known=known, delay_s=args.delay_live)
             except Exception as e:  # noqa: BLE001
-                log.warning("search failed for %s: %s", ref, e)
+                log.warning("lookup failed for %s: %s", ref, e)
                 stats["error"] += 1
                 continue
-            # Record the attempt regardless of outcome so the cadence advances
-            # (a fruitless check still counts — we won't re-poll it immediately).
-            db.mark_hse_checked(conn, ref)
-            conn.commit()
-            if not pub_urls:
-                stats["none"] += 1
-            else:
-                stats["pubs_found"] += 1
-            for pub_url in pub_urls:
-                item = scraper.fetch_live_publication(session, pub_url, delay_s=args.delay_live)
-                if item is None:
-                    stats["error"] += 1
-                    continue
-                # HSE's search matched this ref even if the PDF filename names a
-                # different lead ref (bundled answers). upsert_hse_pdf replaces
-                # the whole junction, so pass parsed refs ∪ {ref} — never just
-                # {ref} — to add the missing link without clobbering existing.
-                if ref not in item.pq_refs:
-                    item.pq_refs = item.pq_refs + [ref]
-                try:
-                    target = scraper.storage_path(cfg.HSE_PDF_DIR, item)
-                    have_file = target.exists() and target.stat().st_size > 0
-                    if item.source_url in known or have_file:
-                        # Already held on disk / in DB — (re)link only.
-                        sha = bytes_size = None
-                        local = target if have_file else None
-                    else:
-                        sha, bytes_size = scraper.download_pdf(
-                            session, item.source_url, target, delay_s=args.delay_live)
-                        local = target
-                        stats["downloaded"] += 1
-                    pdf_id = _save(conn, item, local, sha, bytes_size)
-                    _extract_after_download(conn, pdf_id, item.pq_refs)
-                    conn.commit()
-                    known.add(item.source_url)
-                    stats["linked"] += 1
-                    log.info("linked %s -> pdf_id=%d (%s)", ref, pdf_id, item.filename[:55])
-                except Exception as e:  # noqa: BLE001
-                    log.warning("backfill failed for %s (%s): %s", ref, pub_url, e)
-                    stats["error"] += 1
+            stats["pubs_found"] += 1 if res["found"] else 0
+            stats["none"] += 0 if res["found"] else 1
+            stats["downloaded"] += res["downloaded"]
+            stats["linked"] += res["linked"]
+            stats["error"] += res["errors"]
             if (i % 25) == 0:
                 log.info("progress: %d/%d stats=%s", i, len(refs), stats)
         log.info("=== backfill-missing done: stats=%s ===", stats)

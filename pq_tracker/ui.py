@@ -158,6 +158,8 @@ def _parse_filters(args) -> dict:
         "pqref": (args.get("pqref") or "").strip(),
         "constit": (args.get("constit") or "").strip(),
         "notes": (args.get("notes") or "").strip(),
+        # HSE-reply state filter: '' (any) | 'linked' | 'expected' | 'none'.
+        "hse": (args.get("hse") or "").strip().lower(),
         # Sort.
         "sort": sort,
         "dir": direction,
@@ -443,6 +445,53 @@ def _build_where(f: dict) -> tuple[str, list]:
     return where, params
 
 
+def _compute_hse_state(*, has_pdf: bool, manual, answer_text) -> str:
+    """Three-state HSE-reply label for a PQ, used for the list badge + modal.
+
+      linked   — an HSE supplementary PDF is captured for this PQ
+      expected — none captured, but one is expected (manual=1, or the answer
+                 defers to the HSE per the classifier)
+      none     — no HSE reply expected (manual=0, or classifier says no)
+
+    A captured PDF always wins; a manual override beats the classifier.
+    """
+    if has_pdf:
+        return "linked"
+    if manual == 0:
+        return "none"
+    if manual == 1:
+        return "expected"
+    from .matching import answer_defers_to_hse
+    return "expected" if answer_defers_to_hse(answer_text) else "none"
+
+
+_HSE_LINKED_EXISTS = (
+    "EXISTS (SELECT 1 FROM hse_pdf_pqs j JOIN hse_pdfs p ON p.id = j.hse_pdf_id "
+    "WHERE j.pq_ref = questions.pq_ref AND p.local_path IS NOT NULL)"
+)
+
+
+def _hse_filter_clause(conn, kind: str) -> tuple[str, list]:
+    """SQL fragment for the HSE-state filter. 'expected'/'none' fold in the
+    Python classifier by materialising the candidate set (reusing the backfill
+    selector) and matching pq_ref against it."""
+    if kind == "linked":
+        return _HSE_LINKED_EXISTS, []
+    from . import hse_cli
+    expected = hse_cli._missing_answer_candidates(
+        conn, all_unlinked=False, days=None, recheck_days=None)
+    if kind == "expected":
+        if not expected:
+            return "0", []  # match nothing
+        ph = ",".join("?" * len(expected))
+        return f"questions.pq_ref IN ({ph})", list(expected)
+    # kind == "none": not captured and not expected
+    if expected:
+        ph = ",".join("?" * len(expected))
+        return f"NOT {_HSE_LINKED_EXISTS} AND questions.pq_ref NOT IN ({ph})", list(expected)
+    return f"NOT {_HSE_LINKED_EXISTS}", []
+
+
 @app.route("/")
 def list_view():
     f = _parse_filters(request.args)
@@ -453,6 +502,12 @@ def list_view():
     sort_dir = f["dir"].upper() if f["dir"] in ("asc", "desc") else "DESC"
     grouped = f["group"]
     with _conn() as conn:
+        # HSE-state filter folds in the Python classifier, so it needs the
+        # connection — append it to the WHERE built above.
+        if f["hse"] in ("linked", "expected", "none"):
+            hclause, hparams = _hse_filter_clause(conn, f["hse"])
+            where = where + (" AND " if where else " WHERE ") + hclause
+            params = params + hparams
         search_refs, score_map = _search_prefilter(conn, f)
         # Build the matched-row set the same way regardless of grouping: when
         # search is on, narrow to ranked candidates; otherwise apply WHERE.
@@ -547,6 +602,16 @@ def list_view():
         ).fetchone()[0]
         total_in_db = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    # Collect every ref on the page (incl. grouped siblings) so we can fetch
+    # answer text once for the HSE-reply classifier.
+    def _ref_of(x):
+        return x["pq_ref"]
+    page_refs: set[str] = set()
+    for r in rows:
+        page_refs.add(_ref_of(r))
+        if isinstance(r, dict):
+            for sib in r.get("group_members", []) or []:
+                page_refs.add(_ref_of(sib))
     with _conn() as conn2:
         pq_tags_map = db.pq_tags_by_pqref(conn2)
         hse_pdf_map: dict[str, int] = {}
@@ -558,9 +623,24 @@ def list_view():
                 GROUP BY j.pq_ref"""
         ):
             hse_pdf_map[r2["pq_ref"]] = r2["pdf_id"]
+        answer_text_map: dict[str, str] = {}
+        if page_refs:
+            ph = ",".join("?" * len(page_refs))
+            for r3 in conn2.execute(
+                f"""SELECT q.pq_ref, a.answer_text
+                      FROM questions q LEFT JOIN answers a ON a.id = q.answer_id
+                     WHERE q.pq_ref IN ({ph})""",
+                list(page_refs),
+            ):
+                answer_text_map[r3["pq_ref"]] = r3["answer_text"]
     def _enrich(d: dict) -> dict:
         d["pq_tags"] = pq_tags_map.get(d["pq_ref"], [])
         d["hse_pdf_id"] = hse_pdf_map.get(d["pq_ref"])
+        d["hse_state"] = _compute_hse_state(
+            has_pdf=d["hse_pdf_id"] is not None,
+            manual=d.get("hse_expected_manual"),
+            answer_text=answer_text_map.get(d["pq_ref"]),
+        )
         return d
 
     enriched = []
@@ -997,6 +1077,70 @@ def api_save(pq_ref: str):
     return jsonify({"ok": False, "error": f"DB busy after retries: {last_err}"}), 503
 
 
+def _hse_state_for(conn, pq_ref: str) -> str:
+    """Recompute the HSE-reply state for one PQ from the DB (post-action)."""
+    row = db.get_question(conn, pq_ref)
+    if row is None:
+        return "none"
+    has_pdf = bool(db.get_hse_pdfs_for_pq(conn, pq_ref))
+    answer_text = None
+    if row["answer_id"]:
+        a = conn.execute("SELECT answer_text FROM answers WHERE id=?", (row["answer_id"],)).fetchone()
+        answer_text = a["answer_text"] if a else None
+    return _compute_hse_state(has_pdf=has_pdf, manual=row["hse_expected_manual"],
+                              answer_text=answer_text)
+
+
+@app.route("/api/pq/<path:pq_ref>/hse_label", methods=["POST"])
+def api_hse_label(pq_ref: str):
+    """Set the manual 'expects an HSE reply' override.
+
+    Body JSON {"value": null|0|1}: null = trust the classifier, 1 = force
+    expected, 0 = force not-expected. Returns the recomputed hse_state.
+    """
+    payload = request.get_json(silent=True) or {}
+    value = payload.get("value")
+    if value not in (None, 0, 1):
+        return jsonify({"ok": False, "error": "value must be null, 0, or 1"}), 400
+    with _conn() as conn:
+        if not db.set_hse_expected_manual(conn, pq_ref, value):
+            abort(404)
+        conn.commit()
+        state = _hse_state_for(conn, pq_ref)
+    return jsonify({"ok": True, "hse_state": state, "hse_expected_manual": value})
+
+
+@app.route("/api/pq/<path:pq_ref>/hse_check", methods=["POST"])
+def api_hse_check(pq_ref: str):
+    """Ad-hoc: query about.hse.ie now for this PQ and link any answer found.
+
+    Reuses the same per-ref backfill the scheduled sweep runs. Returns the
+    lookup result plus the recomputed hse_state so the UI can update the badge.
+    """
+    from . import hse_cli, hse_scraper
+    with _conn() as conn:
+        if db.get_question(conn, pq_ref) is None:
+            abort(404)
+        known = db.hse_pdf_source_urls(conn)
+        session = hse_scraper.make_session()
+        try:
+            res = hse_cli.backfill_ref(session, conn, pq_ref, known=known, delay_s=0.0)
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(e)}), 502
+        state = _hse_state_for(conn, pq_ref)
+        # Prefer a downloaded PDF (viewable in the preview modal).
+        pdfs = db.get_hse_pdfs_for_pq(conn, pq_ref)
+        downloaded = [p for p in pdfs if p.get("local_path")]
+        pdf_id = (downloaded or pdfs or [{}])[0].get("id")
+    return jsonify({
+        "ok": True,
+        "found": res["found"],
+        "linked": res["linked"],
+        "hse_state": state,
+        "hse_pdf_id": pdf_id,
+    })
+
+
 def _full_group_size(group_key: str | None) -> int:
     """Count the eIds in a stored group key. Returns 1 for singletons / NULL."""
     if not group_key or "|" not in group_key:
@@ -1110,6 +1254,11 @@ def _row_to_dict(row: sqlite3.Row, conn: sqlite3.Connection | None = None,
         d["hse_pdfs"] = []
         d["shared_with"] = []
         d["shared_total"] = 0
+    d["hse_state"] = _compute_hse_state(
+        has_pdf=bool(d.get("hse_pdfs")),
+        manual=d.get("hse_expected_manual"),
+        answer_text=d.get("answer_text"),
+    )
     return d
 
 

@@ -20,6 +20,27 @@
     <input type="checkbox" id="group-toggle" {% if f.group %}checked{% endif %}>
     <span>Group related</span>
   </label>
+  <label class="group-toggle" title="Filter by HSE supplementary-reply status.">
+    <span>HSE reply</span>
+    <select id="hse-filter">
+      <option value="" {% if not f.hse %}selected{% endif %}>any</option>
+      <option value="linked" {% if f.hse == 'linked' %}selected{% endif %}>captured</option>
+      <option value="expected" {% if f.hse == 'expected' %}selected{% endif %}>expected, not captured</option>
+      <option value="none" {% if f.hse == 'none' %}selected{% endif %}>none expected</option>
+    </select>
+  </label>
+
+  <style>
+    .hse-badge { display:inline-block; font-size:10px; font-weight:700; line-height:1;
+                 padding:2px 5px; border-radius:6px; margin-right:3px; vertical-align:middle; letter-spacing:.3px; }
+    .hse-badge.hse-linked   { background:#1f7a3d; color:#fff; }
+    .hse-badge.hse-expected { background:#fbe7b0; color:#7a5b00; border:1px solid #e6c860; }
+    .hse-label-toggle { display:flex; gap:6px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+    .hse-label-toggle .seg { display:inline-flex; border:1px solid var(--border,#ccc); border-radius:6px; overflow:hidden; }
+    .hse-label-toggle .seg button { border:0; background:transparent; padding:4px 9px; cursor:pointer; font-size:12px; }
+    .hse-label-toggle .seg button.active { background:var(--accent,#2b6cb0); color:#fff; }
+    #m-hse-status { font-size:12px; color:var(--muted,#667); }
+  </style>
   <span style="color:var(--muted);font-size:12px;align-self:center;">
     Click any row for full details + edit.
     Blue chips = auto-tags (from <code>topics.yaml</code> via
@@ -193,6 +214,7 @@
       </td>
       <td class="col col-department" data-col="department">{{ r.department }}</td>
       <td class="cell-chips col col-topics_tags" data-col="topics_tags">
+        {% if r.hse_state == 'linked' %}<span class="hse-badge hse-linked" title="HSE supplementary reply captured">HSE</span>{% elif r.hse_state == 'expected' %}<span class="hse-badge hse-expected" title="HSE reply expected — not yet captured. Open the row to check now.">HSE?</span>{% endif %}
         {% for tag in r.pq_tags %}<span class="chip{% if tag.state == 'user_added' %} chip-tag{% endif %}">{{ tag.tag }}</span>{% endfor %}
       </td>
       <td class="col col-answer_status" data-col="answer_status" title="{{ r.answer_status }}">
@@ -292,6 +314,19 @@
       <section>
         <h3>HSE response PDFs</h3>
         <div id="m-hse-pdfs" style="font-size:13px;"></div>
+        <div class="hse-label-toggle">
+          <span style="font-size:12px;color:var(--muted);">HSE reply expected?</span>
+          <span class="seg" id="m-hse-seg" role="group" aria-label="HSE reply expected">
+            <button type="button" data-val="auto"  title="Trust the classifier (default)">Auto</button>
+            <button type="button" data-val="1"     title="Force: an HSE reply is expected">Expected</button>
+            <button type="button" data-val="0"     title="Force: no HSE reply expected">Not&nbsp;expected</button>
+          </span>
+          <button type="button" class="btn secondary" id="m-hse-check"
+                  title="Query about.hse.ie now for this PQ and link any reply found.">
+            Check HSE now
+          </button>
+          <span id="m-hse-status"></span>
+        </div>
       </section>
 
       <section>
@@ -440,6 +475,9 @@
     tagInput: document.getElementById('m-taginput'),
     tagSuggest: document.getElementById('m-tagsuggest'),
     hsePdfs: document.getElementById('m-hse-pdfs'),
+    hseSeg: document.getElementById('m-hse-seg'),
+    hseCheck: document.getElementById('m-hse-check'),
+    hseStatus: document.getElementById('m-hse-status'),
   };
   let currentRef = null;
   let currentRowEl = null;
@@ -764,10 +802,86 @@
     els.constituent.value = row.constituent || '';
     els.notes.value = row.notes || '';
     renderHsePdfs(row.hse_pdfs || []);
+    renderHseState(row);
     els.tagInput.value = '';
     renderTags();
     setMsg('');
     els.constituent.focus();
+  }
+
+  function hseStateLabel(s) {
+    if (s === 'linked') return 'captured';
+    if (s === 'expected') return 'expected — not yet captured';
+    return 'none expected';
+  }
+
+  function renderHseState(row) {
+    const manual = row.hse_expected_manual;          // null | 0 | 1
+    const sel = manual === 1 ? '1' : (manual === 0 ? '0' : 'auto');
+    if (els.hseSeg) {
+      els.hseSeg.querySelectorAll('button').forEach(function (b) {
+        b.classList.toggle('active', b.dataset.val === sel);
+      });
+    }
+    if (els.hseStatus) els.hseStatus.textContent = hseStateLabel(row.hse_state);
+  }
+
+  // Live-update a list row's HSE badge after a label change / check.
+  function updateRowBadge(ref, state) {
+    const tr = document.querySelector('tr[data-pqref="' + ref + '"]');
+    if (!tr) return;
+    const cell = tr.querySelector('.cell-chips');
+    if (!cell) return;
+    let badge = cell.querySelector('.hse-badge');
+    if (state === 'linked' || state === 'expected') {
+      if (!badge) { badge = document.createElement('span'); cell.insertBefore(badge, cell.firstChild); }
+      badge.className = 'hse-badge ' + (state === 'linked' ? 'hse-linked' : 'hse-expected');
+      badge.textContent = state === 'linked' ? 'HSE' : 'HSE?';
+      badge.title = state === 'linked'
+        ? 'HSE supplementary reply captured'
+        : 'HSE reply expected — not yet captured. Open the row to check now.';
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+
+  if (els.hseSeg) {
+    els.hseSeg.addEventListener('click', function (e) {
+      const btn = e.target.closest('button[data-val]');
+      if (!btn || !currentRef) return;
+      const val = btn.dataset.val === 'auto' ? null : Number(btn.dataset.val);
+      els.hseStatus.textContent = 'saving…';
+      fetch('/api/pq/' + encodeURIComponent(currentRef) + '/hse_label', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: val }),
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) { els.hseStatus.textContent = 'error'; return; }
+        renderHseState({ hse_expected_manual: d.hse_expected_manual, hse_state: d.hse_state });
+        updateRowBadge(currentRef, d.hse_state);
+      }).catch(function () { els.hseStatus.textContent = 'error'; });
+    });
+  }
+
+  if (els.hseCheck) {
+    els.hseCheck.addEventListener('click', function () {
+      if (!currentRef) return;
+      const ref = currentRef, rowEl = currentRowEl;
+      els.hseStatus.textContent = 'checking about.hse.ie…';
+      els.hseCheck.disabled = true;
+      fetch('/api/pq/' + encodeURIComponent(ref) + '/hse_check', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        els.hseCheck.disabled = false;
+        if (!d.ok) { els.hseStatus.textContent = 'error: ' + (d.error || 'lookup failed'); return; }
+        updateRowBadge(ref, d.hse_state);
+        if (d.linked) {
+          els.hseStatus.textContent = 'found and linked an HSE reply';
+          if (currentRef === ref) open(ref, rowEl);   // refresh to show the PDF
+        } else {
+          els.hseStatus.textContent = 'no HSE reply found on the live site';
+        }
+      }).catch(function () { els.hseCheck.disabled = false; els.hseStatus.textContent = 'error'; });
+    });
   }
 
   function save() {
@@ -1283,6 +1397,17 @@ const FILTER_LABEL = {
       } else {
         u.searchParams.set('group', '0');
       }
+      u.searchParams.delete('page');
+      window.location.href = u.toString();
+    });
+  }
+
+  const hseFilter = document.getElementById('hse-filter');
+  if (hseFilter) {
+    hseFilter.addEventListener('change', function () {
+      const u = new URL(window.location.href);
+      if (hseFilter.value) { u.searchParams.set('hse', hseFilter.value); }
+      else { u.searchParams.delete('hse'); }
       u.searchParams.delete('page');
       window.location.href = u.toString();
     });
