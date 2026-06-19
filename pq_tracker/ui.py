@@ -446,23 +446,25 @@ def _build_where(f: dict) -> tuple[str, list]:
 
 
 def _compute_hse_state(*, has_pdf: bool, manual, answer_text) -> str:
-    """Three-state HSE-reply label for a PQ, used for the list badge + modal.
+    """HSE-reply label for a PQ, used for the list badge + modal.
 
-      linked   — an HSE supplementary PDF is captured for this PQ
-      expected — none captured, but one is expected (manual=1, or the answer
-                 defers to the HSE per the classifier)
-      none     — no HSE reply expected (manual=0, or classifier says no)
+      linked          — an HSE supplementary PDF is captured for this PQ
+      expected_manual — none captured, you marked it expected (manual=1)
+      expected_auto   — none captured, the classifier thinks one is coming
+      none            — no HSE reply expected (manual=0, or classifier says no)
 
-    A captured PDF always wins; a manual override beats the classifier.
+    A captured PDF always wins; a manual override beats the classifier. The
+    two 'expected' states differ only by source so the badge can colour them
+    apart (red = you said so, amber = a guess).
     """
     if has_pdf:
         return "linked"
     if manual == 0:
         return "none"
     if manual == 1:
-        return "expected"
+        return "expected_manual"
     from .matching import answer_defers_to_hse
-    return "expected" if answer_defers_to_hse(answer_text) else "none"
+    return "expected_auto" if answer_defers_to_hse(answer_text) else "none"
 
 
 _HSE_LINKED_EXISTS = (
@@ -1091,6 +1093,14 @@ def _hse_state_for(conn, pq_ref: str) -> str:
                               answer_text=answer_text)
 
 
+def _hse_last_checked_for(conn, pq_ref: str):
+    """ISO timestamp of the last about.hse.ie lookup for this PQ, or None."""
+    row = conn.execute(
+        "SELECT hse_last_checked FROM questions WHERE pq_ref = ?", (pq_ref,)
+    ).fetchone()
+    return row["hse_last_checked"] if row else None
+
+
 @app.route("/api/pq/<path:pq_ref>/hse_label", methods=["POST"])
 def api_hse_label(pq_ref: str):
     """Set the manual 'expects an HSE reply' override.
@@ -1107,7 +1117,9 @@ def api_hse_label(pq_ref: str):
             abort(404)
         conn.commit()
         state = _hse_state_for(conn, pq_ref)
-    return jsonify({"ok": True, "hse_state": state, "hse_expected_manual": value})
+        last_checked = _hse_last_checked_for(conn, pq_ref)
+    return jsonify({"ok": True, "hse_state": state, "hse_expected_manual": value,
+                    "hse_last_checked": last_checked})
 
 
 @app.route("/api/pq/<path:pq_ref>/hse_check", methods=["POST"])
@@ -1128,6 +1140,7 @@ def api_hse_check(pq_ref: str):
         except Exception as e:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 502
         state = _hse_state_for(conn, pq_ref)
+        last_checked = _hse_last_checked_for(conn, pq_ref)
         # Prefer a downloaded PDF (viewable in the preview modal).
         pdfs = db.get_hse_pdfs_for_pq(conn, pq_ref)
         downloaded = [p for p in pdfs if p.get("local_path")]
@@ -1137,6 +1150,7 @@ def api_hse_check(pq_ref: str):
         "found": res["found"],
         "linked": res["linked"],
         "hse_state": state,
+        "hse_last_checked": last_checked,
         "hse_pdf_id": pdf_id,
     })
 
